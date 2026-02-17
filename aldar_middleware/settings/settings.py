@@ -4,13 +4,20 @@ import enum
 import json
 from pathlib import Path
 from tempfile import gettempdir
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from yarl import URL
 
 TEMP_DIR = Path(gettempdir())
+
+
+def _strip_inline_comment(value: Any) -> Any:
+    """Strip inline # comment from env value (e.g. Azure App Settings from .env)."""
+    if isinstance(value, str) and "#" in value:
+        return value.split("#")[0].strip()
+    return value
 
 
 class Environment(str, enum.Enum):
@@ -390,6 +397,20 @@ class Settings(BaseSettings):
             return self.celery_result_backend
         # Ignore Azure Service Bus URLs and use Redis instead
         return str(self.redis_url_property)
+
+    @field_validator(
+        "max_attachment_size_bytes",
+        "chat_attachment_sas_token_expiry_hours",
+        "shared_pdf_sas_token_expiry_hours",
+        "cosmos_log_verbose",
+        mode="before",
+    )
+    @classmethod
+    def strip_env_inline_comment(cls, v):  # noqa: ANN001
+        """Strip inline # comments from env values (Azure App Settings from .env)."""
+        if isinstance(v, str):
+            return _strip_inline_comment(v)
+        return v
 
     @field_validator('jwt_secret_key')
     @classmethod
