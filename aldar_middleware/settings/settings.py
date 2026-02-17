@@ -6,7 +6,7 @@ from pathlib import Path
 from tempfile import gettempdir
 from typing import Any, List, Optional
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from yarl import URL
 
@@ -398,19 +398,13 @@ class Settings(BaseSettings):
         # Ignore Azure Service Bus URLs and use Redis instead
         return str(self.redis_url_property)
 
-    @field_validator(
-        "max_attachment_size_bytes",
-        "chat_attachment_sas_token_expiry_hours",
-        "shared_pdf_sas_token_expiry_hours",
-        "cosmos_log_verbose",
-        mode="before",
-    )
+    @model_validator(mode="before")
     @classmethod
-    def strip_env_inline_comment(cls, v):  # noqa: ANN001
-        """Strip inline # comments from env values (Azure App Settings from .env)."""
-        if isinstance(v, str):
-            return _strip_inline_comment(v)
-        return v
+    def strip_inline_comments_from_env(cls, data: Any) -> Any:
+        """Strip inline # comments from all string values (Azure App Settings from .env)."""
+        if isinstance(data, dict):
+            return {k: _strip_inline_comment(v) if isinstance(v, str) else v for k, v in data.items()}
+        return data
 
     @field_validator('jwt_secret_key')
     @classmethod
