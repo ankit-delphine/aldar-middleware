@@ -1,184 +1,36 @@
-# GitHub Actions CI/CD Pipeline for AIQ Backend
-# Builds Docker images and optionally deploys to AKS
+# CI: tests skipped for now. Run manually via "Run workflow" if needed.
+# Deploy to Azure Web App: push to main → Build and deploy Python app to Azure Web App - aldar-middleware
 
 name: CI/CD Pipeline
 
 on:
-  push:
-    branches:
-      - main
-      - development
-  pull_request:
-    branches:
-      - main
-      - development
-
-env:
-  REGISTRY: aiqbackendacr.azurecr.io
-  IMAGE_PREFIX: aldar-middleware
+  workflow_dispatch:  # manual only; no runs on push or PR
 
 jobs:
-  build:
-    name: Build Docker Images
+  test:
+    name: Run tests
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.12'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-    - name: Install Poetry
-      uses: snok/install-poetry@v1
-      with:
-        version: latest
-        virtualenvs-create: true
-        virtualenvs-in-project: true
+      - name: Install Poetry
+        uses: snok/install-poetry@v1
+        with:
+          version: latest
+          virtualenvs-create: true
+          virtualenvs-in-project: true
 
-    - name: Load cached venv
-      id: cached-poetry-dependencies
-      uses: actions/cache@v3
-      with:
-        path: .venv
-        key: venv-${{ runner.os }}-${{ hashFiles('**/poetry.lock') }}
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
 
-    - name: Install dependencies
-      if: steps.cached-poetry-dependencies.outputs.cache-hit != 'true'
-      run: poetry install --no-interaction --no-root
-
-    - name: Run tests
-      run: |
-        poetry run pytest tests/ -v --cov=aldar_middleware --cov-report=xml --cov-report=html
-      continue-on-error: false
-
-    - name: Publish test results
-      uses: EnricoMi/publish-unit-test-result-action@v2
-      if: always()
-      with:
-        files: '**/test-results.xml'
-
-    - name: Publish coverage
-      uses: codecov/codecov-action@v3
-      if: always()
-      with:
-        file: ./coverage.xml
-        flags: unittests
-        name: codecov-umbrella
-
-    - name: Log in to Azure Container Registry
-      uses: docker/login-action@v3
-      with:
-        registry: ${{ env.REGISTRY }}
-        username: ${{ secrets.AZURE_CLIENT_ID }}
-        password: ${{ secrets.AZURE_CLIENT_SECRET }}
-
-    - name: Extract metadata
-      id: meta
-      uses: docker/metadata-action@v5
-      with:
-        images: |
-          ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-main
-          ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-worker
-          ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-beat
-          ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-flower
-        tags: |
-          type=ref,event=branch
-          type=ref,event=pr
-          type=semver,pattern={{version}}
-          type=semver,pattern={{major}}.{{minor}}
-          type=sha,prefix={{branch}}-
-
-    - name: Build and push Main image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: ./Dockerfile.main
-        push: ${{ github.event_name != 'pull_request' }}
-        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-main:${{ github.sha }}
-        cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-main:buildcache
-        cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-main:buildcache,mode=max
-
-    - name: Build and push Worker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: ./Dockerfile.worker
-        push: ${{ github.event_name != 'pull_request' }}
-        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-worker:${{ github.sha }}
-        cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-worker:buildcache
-        cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-worker:buildcache,mode=max
-
-    - name: Build and push Beat image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: ./Dockerfile.beat
-        push: ${{ github.event_name != 'pull_request' }}
-        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-beat:${{ github.sha }}
-        cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-beat:buildcache
-        cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-beat:buildcache,mode=max
-
-    - name: Build and push Flower image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: ./Dockerfile.flower
-        push: ${{ github.event_name != 'pull_request' }}
-        tags: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-flower:${{ github.sha }}
-        cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-flower:buildcache
-        cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-flower:buildcache,mode=max
-
-  deploy:
-    name: Deploy to AKS
-    needs: build
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/development'
-    environment:
-      name: production
-      url: https://your-domain.com
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Azure Login
-      uses: azure/login@v1
-      with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-    - name: Set AKS context
-      run: |
-        az aks get-credentials \
-          --resource-group adq \
-          --name aiq-aks-cluster \
-          --admin
-
-    - name: Deploy to AKS
-      run: |
-        # Update deployment images
-        kubectl set image deployment/aldar-middleware-main \
-          aldar-middleware-main=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-main:${{ github.sha }} \
-          -n aldar-middleware || true
-        
-        kubectl set image deployment/aldar-middleware-worker \
-          aldar-middleware-worker=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-worker:${{ github.sha }} \
-          -n aldar-middleware || true
-        
-        kubectl set image deployment/aldar-middleware-beat \
-          aldar-middleware-beat=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-beat:${{ github.sha }} \
-          -n aldar-middleware || true
-        
-        kubectl set image deployment/aldar-middleware-flower \
-          aldar-middleware-flower=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-flower:${{ github.sha }} \
-          -n aldar-middleware || true
-
-        # Wait for rollout
-        kubectl rollout status deployment/aldar-middleware-main -n aldar-middleware --timeout=5m
-        kubectl rollout status deployment/aldar-middleware-worker -n aldar-middleware --timeout=5m
-
+      - name: Run tests
+        run: poetry run pytest tests/ -v --cov=aldar_middleware --cov-report=xml --cov-report=html

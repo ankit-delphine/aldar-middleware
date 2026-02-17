@@ -32,13 +32,19 @@ jobs:
           source antenv/bin/activate
           pip install -r requirements.txt
                 
-      # Include antenv in deployment so the server has all deps (gunicorn, uvicorn, etc.).
-      # Oryx build on the server was not creating antenv, causing "UvicornWorker not found".
+      # Include antenv so the server has all deps (gunicorn, uvicorn, etc.).
       - name: Upload artifact for deployment jobs
         uses: actions/upload-artifact@v4
         with:
           name: python-app
-          path: .
+          path: |
+            .
+            !.git
+            !.github
+            !**/__pycache__
+            !**/.pytest_cache
+            !.venv
+          retention-days: 1
 
       # 🚫 Opting Out of Oryx Build
       # If you prefer to disable the Oryx build process during deployment, follow these steps:
