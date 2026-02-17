@@ -169,5 +169,7 @@ alerting.bak/
 tests/rbac/test_config.py
 *.md
 *.txt
+!requirements.txt
+!runtime.txt
 *.ps1
 node_modules/
