@@ -1,0 +1,17 @@
+apiVersion: 1
+
+datasources:
+  - uid: prometheus_uid
+    name: Prometheus
+    type: prometheus
+    access: proxy
+    url: https://adq-amw-g0bah9fdcsbcacbt.uaenorth.prometheus.monitor.azure.com
+    isDefault: true
+    editable: false
+    basicAuth: true
+    basicAuthUser: adq-monitor
+    secureJsonData:
+      basicAuthPassword: $GF_PROMETHEUS_PASSWORD
+    jsonData:
+      timeInterval: 5s
+      httpMethod: POST

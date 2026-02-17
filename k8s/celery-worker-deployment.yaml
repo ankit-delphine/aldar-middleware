@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiq-celery-worker
+  namespace: aldar-middleware
+  labels:
+    app: aiq-celery-worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aiq-celery-worker
+  template:
+    metadata:
+      labels:
+        app: aiq-celery-worker
+    spec:
+      containers:
+      - name: celery-worker
+        image: aldar-middleware:latest
+        command: ["celery", "-A", "aldar_middleware.queue.celery_app", "worker", "--loglevel=info"]
+        envFrom:
+        - configMapRef:
+            name: aldar-middleware-config
+        - secretRef:
+            name: aldar-middleware-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "400m"
+        volumeMounts:
+        - name: worker-logs
+          mountPath: /app/logs
+      volumes:
+      - name: worker-logs
+        emptyDir: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aiq-celery-beat
+  namespace: aldar-middleware
+  labels:
+    app: aiq-celery-beat
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aiq-celery-beat
+  template:
+    metadata:
+      labels:
+        app: aiq-celery-beat
+    spec:
+      containers:
+      - name: celery-beat
+        image: aldar-middleware:latest
+        command: ["celery", "-A", "aldar_middleware.queue.celery_app", "beat", "--loglevel=info"]
+        envFrom:
+        - configMapRef:
+            name: aldar-middleware-config
+        - secretRef:
+            name: aldar-middleware-secrets
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        volumeMounts:
+        - name: beat-logs
+          mountPath: /app/logs
+      volumes:
+      - name: beat-logs
+        emptyDir: {}

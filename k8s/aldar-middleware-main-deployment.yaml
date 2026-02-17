@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aldar-middleware-main
+  namespace: aldar-middleware
+  labels:
+    app: aldar-middleware-main
+    component: main
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aldar-middleware-main
+  template:
+    metadata:
+      labels:
+        app: aldar-middleware-main
+        component: main
+    spec:
+      containers:
+      - name: aldar-middleware-main
+        image: aiqbackendacr.azurecr.io/aldar-middleware-main:latest
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: aldar-middleware-config
+        - secretRef:
+            name: aldar-middleware-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/v1/health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /api/v1/health
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: app-logs
+          mountPath: /app/logs
+      volumes:
+      - name: app-logs
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aldar-middleware-main-service
+  namespace: aldar-middleware
+  labels:
+    component: main
+spec:
+  selector:
+    app: aldar-middleware-main
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: LoadBalancer

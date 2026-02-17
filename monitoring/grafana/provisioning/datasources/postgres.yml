@@ -1,0 +1,20 @@
+apiVersion: 1
+
+datasources:
+  - name: PostgreSQL
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    database: aldar_middleware
+    user: aiq_user
+    password: ${DB_PASSWORD}
+    isDefault: false
+    editable: false
+    jsonData:
+      sslmode: disable
+      version: 12
+      minInterval: 10s
+      maxOpenConns: 10
+      maxIdleConns: 2
+    secureJsonData:
+      password: ${DB_PASSWORD}

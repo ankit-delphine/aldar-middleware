@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: aldar-middleware
+  labels:
+    name: aldar-middleware
+    environment: development

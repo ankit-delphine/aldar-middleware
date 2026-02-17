@@ -1,0 +1,102 @@
+apiVersion: 1
+
+contactPoints:
+  # ========================================
+  # SLACK NOTIFICATIONS
+  # ========================================
+  - orgId: 1
+    name: slack-critical
+    receivers:
+      - uid: slack_critical_receiver
+        type: slack
+        settings:
+          url: ${SLACK_CRITICAL_WEBHOOK_URL}
+          recipient: "#aiq-alerts-critical"
+          username: "AIQ Backend Alerts - Critical"
+          icon_emoji: ":rotating_light:"
+          title: "{{ .GroupLabels.alertname }}"
+          text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+        disableResolveMessage: false
+
+  - orgId: 1
+    name: slack-warnings
+    receivers:
+      - uid: slack_warning_receiver
+        type: slack
+        settings:
+          url: ${SLACK_WARNING_WEBHOOK_URL}
+          recipient: "#aiq-alerts-warnings"
+          username: "AIQ Backend Alerts - Warnings"
+          icon_emoji: ":warning:"
+          title: "{{ .GroupLabels.alertname }}"
+          text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+        disableResolveMessage: false
+
+  - orgId: 1
+    name: slack-info
+    receivers:
+      - uid: slack_info_receiver
+        type: slack
+        settings:
+          url: ${SLACK_INFO_WEBHOOK_URL}
+          recipient: "#aiq-alerts-info"
+          username: "AIQ Backend Alerts - Info"
+          icon_emoji: ":information_source:"
+          title: "{{ .GroupLabels.alertname }}"
+          text: "{{ range .Alerts }}{{ .Annotations.description }}\n{{ end }}"
+        disableResolveMessage: true
+
+  # ========================================
+  # EMAIL NOTIFICATIONS
+  # ========================================
+  - orgId: 1
+    name: email-oncall
+    receivers:
+      - uid: email_oncall_receiver
+        type: email
+        settings:
+          addresses: ${ONCALL_EMAIL}
+          singleEmail: false
+          message: |-
+            Alert: {{ .GroupLabels.alertname }}
+            Severity: {{ .GroupLabels.severity }}
+            
+            {{ range .Alerts }}
+            {{ .Annotations.description }}
+            {{ end }}
+            
+            Runbook: {{ (index .Alerts 0).Annotations.runbook_url }}
+
+  - orgId: 1
+    name: email-team
+    receivers:
+      - uid: email_team_receiver
+        type: email
+        settings:
+          addresses: ${TEAM_EMAIL}
+          singleEmail: true
+          message: |-
+            Alert: {{ .GroupLabels.alertname }}
+            Service: {{ .GroupLabels.service }}
+            Severity: {{ .GroupLabels.severity }}
+            
+            {{ range .Alerts }}
+            {{ .Annotations.description }}
+            {{ end }}
+            
+            Runbook: {{ (index .Alerts 0).Annotations.runbook_url }}
+
+  # ========================================
+  # PAGERDUTY NOTIFICATIONS
+  # ========================================
+  - orgId: 1
+    name: pagerduty-oncall
+    receivers:
+      - uid: pagerduty_oncall_receiver
+        type: pagerduty
+        settings:
+          integrationKey: ${PAGERDUTY_INTEGRATION_KEY}
+          severity: "{{ if eq .GroupLabels.severity \"critical\" }}critical{{ else }}warning{{ end }}"
+          client: "AIQ Backend"
+          clientUrl: "{{ .ExternalURL }}"
+          description: "{{ .GroupLabels.alertname }}: {{ (index .Alerts 0).Annotations.summary }}"

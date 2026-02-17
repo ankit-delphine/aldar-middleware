@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aldar-middleware-worker
+  namespace: aldar-middleware
+  labels:
+    app: aldar-middleware-worker
+    component: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aldar-middleware-worker
+  template:
+    metadata:
+      labels:
+        app: aldar-middleware-worker
+        component: worker
+    spec:
+      containers:
+      - name: aldar-middleware-worker
+        image: aiqbackendacr.azurecr.io/aldar-middleware-worker:latest
+        envFrom:
+        - configMapRef:
+            name: aldar-middleware-config
+        - secretRef:
+            name: aldar-middleware-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "250m"
+        livenessProbe:
+          exec:
+            command:
+            - celery
+            - -A
+            - aldar_middleware.queue.celery_app
+            - inspect
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 30
+        readinessProbe:
+          exec:
+            command:
+            - celery
+            - -A
+            - aldar_middleware.queue.celery_app
+            - inspect
+            - ping
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        volumeMounts:
+        - name: app-logs
+          mountPath: /app/logs
+      volumes:
+      - name: app-logs
+        emptyDir: {}

@@ -1,0 +1,48 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aldar-middleware-main
+  namespace: middleware-main
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aldar-middleware-main
+  template:
+    metadata:
+      labels:
+        app: aldar-middleware-main
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+        - name: aldar-middleware-main
+          image: acradqaioshared01.azurecr.io/aldar-middleware-main:latest
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "2Gi"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aldar-middleware-main-service
+  namespace: middleware-main
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-internal: "true"
+spec:
+  type: LoadBalancer
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+      name: http
+  selector:
+    app: aldar-middleware-main

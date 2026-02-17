@@ -1,0 +1,664 @@
+groups:
+  - name: ALDAR_Tracing_Alerts
+    interval: 30s
+    rules:
+      # ========================================
+      # CRITICAL ALERTS (P1)
+      # ========================================
+      
+      - uid: aiq_high_error_rate
+        title: High Agent Error Rate
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: sum(rate(aiq_agent_errors_total[5m]))
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [1.0]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 2m
+        annotations:
+          description: "Agent error rate: {{ $value | humanize }} errors/sec. Check trace details in dashboard."
+          summary: "High agent error rate detected"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#high-error-rate"
+        labels:
+          severity: critical
+          team: backend
+          service: aiq-agents
+
+      - uid: aiq_database_query_timeout
+        title: Database Query Timeout
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: postgres
+            model:
+              rawSql: "SELECT COUNT(*) as timeout_count FROM database_query_traces WHERE created_at > NOW() - INTERVAL '5 minutes' AND performance_classification = 'very_slow'"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [50]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 2m
+        annotations:
+          description: "{{ $value }} very slow queries detected in last 5 minutes"
+          summary: "Database performance degradation detected"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#database-timeout"
+        labels:
+          severity: critical
+          team: backend
+          service: aiq-database
+
+      - uid: aiq_trace_loss_detected
+        title: Trace Data Loss Detected
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: postgres
+            model:
+              rawSql: "SELECT COUNT(*) as error_count FROM distributed_traces WHERE created_at > NOW() - INTERVAL '5 minutes' AND status = 'error'"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [100]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 2m
+        annotations:
+          description: "{{ $value }} traces in error state. Observability may be impacted."
+          summary: "Trace data collection failing"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#trace-loss"
+        labels:
+          severity: critical
+          team: backend
+          service: aiq-observability
+
+      # ========================================
+      # WARNING ALERTS (P2)
+      # ========================================
+
+      - uid: aiq_slow_query_volume_warning
+        title: High Slow Query Volume
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: postgres
+            model:
+              rawSql: "SELECT COUNT(*) as slow_query_count FROM database_query_traces WHERE created_at > NOW() - INTERVAL '5 minutes' AND performance_classification IN ('slow', 'very_slow')"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [20]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: "{{ $value }} slow queries detected. Review slow query dashboard."
+          summary: "Elevated slow query volume"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#slow-queries"
+        labels:
+          severity: warning
+          team: backend
+          service: aiq-database
+
+      - uid: aiq_audit_log_volume_warning
+        title: High Audit Log Volume
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: postgres
+            model:
+              rawSql: "SELECT COUNT(*) as audit_count FROM request_response_audits WHERE created_at > NOW() - INTERVAL '5 minutes'"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [5000]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: "{{ $value }} audit logs in 5 minutes. Storage usage increasing."
+          summary: "High audit log volume detected"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#audit-volume"
+        labels:
+          severity: warning
+          team: backend
+          service: aiq-observability
+
+      - uid: aiq_trace_database_growth_warning
+        title: Trace Database Rapid Growth
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: postgres
+            model:
+              rawSql: "SELECT COUNT(*) as total_traces FROM distributed_traces WHERE created_at > NOW() - INTERVAL '1 hour'"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [10000]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: "{{ $value }} traces stored in last hour. Sampling rate may need adjustment."
+          summary: "Rapid trace database growth detected"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#trace-growth"
+        labels:
+          severity: warning
+          team: backend
+          service: aiq-observability
+
+      # ========================================
+      # INFO ALERTS (P3)
+      # ========================================
+
+      - uid: aiq_sampling_rate_info
+        title: Trace Sampling Rate Status
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: postgres
+            model:
+              rawSql: "SELECT sample_rate, COUNT(*) FROM distributed_traces WHERE created_at > NOW() - INTERVAL '1 hour' GROUP BY sample_rate"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [0]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 30m
+        annotations:
+          description: "Trace sampling distribution: {{ $value }} traces. Review sampling configuration."
+          summary: "Trace sampling rate info"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#sampling-rates"
+        labels:
+          severity: info
+          team: backend
+          service: aiq-observability
+
+  # ========================================
+  # OPERATIONAL ALERTS
+  # ========================================
+  - name: ALDAR_Operational_Alerts
+    folder: Operations
+    interval: 30s
+    rules:
+      # ========================================
+      # CRITICAL ALERTS (P1)
+      # ========================================
+
+      - uid: aiq_extremely_high_cost
+        title: Extremely High Cost Alert
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: increase(aiq_openai_cost_estimated_usd[1h])
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [20]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: "Hourly cost: ${{ $value | humanize }}. Potential abuse or unexpected usage spike. Check Dashboard 02 (OpenAI Cost)."
+          summary: "Extremely high OpenAI cost detected"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#extremely-high-cost"
+        labels:
+          severity: critical
+          team: backend
+          service: aiq-openai
+
+      - uid: aiq_very_low_success_rate
+        title: Very Low Success Rate Alert
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: "(sum(rate(aiq_agent_requests_total{status=\"success\"}[5m])) / sum(rate(aiq_agent_requests_total[5m]))) * 100"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [90]
+                    type: lt
+        noDataState: NoData
+        execErrState: Error
+        for: 3m
+        annotations:
+          description: "Agent success rate: {{ $value | humanize }}%. Widespread service degradation. Check Dashboard 01 (Agent Performance)."
+          summary: "Very low agent success rate"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#very-low-success-rate"
+        labels:
+          severity: critical
+          team: backend
+          service: aiq-agents
+
+      - uid: aiq_extreme_agent_latency
+        title: Extreme Agent Latency Alert
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: "histogram_quantile(0.95, sum(rate(aiq_agent_request_duration_seconds_bucket[5m])) by (le))"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [10]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 3m
+        annotations:
+          description: "p95 latency: {{ $value | humanize }}s. Poor user experience, potential timeouts. Check Dashboard 01."
+          summary: "Extreme agent request latency"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#extreme-latency"
+        labels:
+          severity: critical
+          team: backend
+          service: aiq-agents
+
+      # ========================================
+      # WARNING ALERTS (P2)
+      # ========================================
+
+      - uid: aiq_elevated_error_rate
+        title: Elevated Error Rate Alert
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: sum(rate(aiq_agent_errors_total[5m]))
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [0.1]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: "Error rate: {{ $value | humanize }} errors/sec. Increased failure rate. Check Dashboard 05 (Error Analysis)."
+          summary: "Elevated agent error rate"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#elevated-error-rate"
+        labels:
+          severity: warning
+          team: backend
+          service: aiq-agents
+
+      - uid: aiq_high_cost_warning
+        title: High Cost Warning Alert
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: increase(aiq_openai_cost_estimated_usd[1h])
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [10]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: "Hourly cost: ${{ $value | humanize }}. Budget concern. Review Dashboard 02 (OpenAI Cost)."
+          summary: "High OpenAI cost warning"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#high-cost-warning"
+        labels:
+          severity: warning
+          team: backend
+          service: aiq-openai
+
+      - uid: aiq_low_success_rate_warning
+        title: Low Success Rate Warning Alert
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: "(sum(rate(aiq_agent_requests_total{status=\"success\"}[5m])) / sum(rate(aiq_agent_requests_total[5m]))) * 100"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [95]
+                    type: lt
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: "Success rate: {{ $value | humanize }}%. Service degradation detected. Check Dashboard 01."
+          summary: "Low agent success rate warning"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#low-success-warning"
+        labels:
+          severity: warning
+          team: backend
+          service: aiq-agents
+
+      - uid: aiq_high_latency_warning
+        title: High Latency Warning Alert
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: "histogram_quantile(0.95, sum(rate(aiq_agent_request_duration_seconds_bucket[5m])) by (le))"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [5]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: "p95 latency: {{ $value | humanize }}s. Degraded performance. Check Dashboard 01."
+          summary: "High agent request latency warning"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#high-latency-warning"
+        labels:
+          severity: warning
+          team: backend
+          service: aiq-agents
+
+      - uid: aiq_low_correlation_coverage
+        title: Low Correlation ID Coverage Alert
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: "(sum(aiq_requests_with_correlation_id_total{has_correlation_id=\"true\"}) / sum(aiq_requests_with_correlation_id_total)) * 100"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [90]
+                    type: lt
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: "Correlation ID coverage: {{ $value | humanize }}%. Reduced observability. Check Dashboard 04 (Request Tracking)."
+          summary: "Low correlation ID coverage warning"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#low-correlation-coverage"
+        labels:
+          severity: warning
+          team: backend
+          service: aiq-observability
+
+      - uid: aiq_mcp_connection_failures
+        title: MCP Connection Failures Alert
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: sum(rate(aiq_mcp_connection_errors_total[5m]))
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [0.05]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 3m
+        annotations:
+          description: "MCP connection errors: {{ $value | humanize }} errors/sec. Integration issues detected. Check Dashboard 05."
+          summary: "MCP connection failures warning"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#mcp-failures"
+        labels:
+          severity: warning
+          team: backend
+          service: aiq-mcp
+
+      # ========================================
+      # INFO ALERTS (P3)
+      # ========================================
+
+      - uid: aiq_daily_budget_exceeded
+        title: Daily Budget Exceeded Alert
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: increase(aiq_openai_cost_estimated_usd[24h])
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [100]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 30m
+        annotations:
+          description: "Daily cost: ${{ $value | humanize }}. Budget review needed. Check Dashboard 02."
+          summary: "Daily budget exceeded info"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#daily-budget"
+        labels:
+          severity: info
+          team: backend
+          service: aiq-openai
+
+      - uid: aiq_unusual_multi_agent_activity
+        title: Unusual Multi-Agent Activity Alert
+        condition: C
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            model:
+              expr: "avg(aiq_agents_used_per_request)"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator:
+                    params: [4]
+                    type: gt
+        noDataState: NoData
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: "Average agents per request: {{ $value | humanize }}. Unusual complex orchestration detected. Check Dashboard 03."
+          summary: "Unusual multi-agent activity info"
+          runbook_url: "https://github.com/your-org/aldar-middleware/wiki/Runbooks#multi-agent-activity"
+        labels:
+          severity: info
+          team: backend
+          service: aiq-agents

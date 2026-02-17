@@ -1,0 +1,73 @@
+# Ignore unnecessary files for deployment
+.git
+.gitignore
+.venv
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.log
+.mypy_cache
+.pytest_cache
+.hypothesis
+
+# Development files
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test files
+tests/
+test_*
+
+# Docker files (not needed for Azure App Service)
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Kubernetes files
+k8s/
+
+# Scripts (except deployment scripts)
+scripts/
+*.sh
+
+# Monitoring files
+monitoring/
+
+# Logs
+logs/
+*.log
+
+# Temporary files
+tmp/
+temp/
+
+# Documentation (keep essential ones)
+*.md
+!README.md

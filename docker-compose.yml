@@ -1,0 +1,312 @@
+services:
+  # Main FastAPI Application
+  api:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.main
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    image: aldar-middleware-main:${ALDAR_VERSION:-latest}
+    pull_policy: build
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+    environment:
+      # Use database credentials from .env file (Azure DB or other)
+      ALDAR_DB_HOST: ${ALDAR_DB_HOST}
+      ALDAR_DB_PORT: ${ALDAR_DB_PORT}
+      ALDAR_DB_USER: ${ALDAR_DB_USER}
+      ALDAR_DB_PASS: ${ALDAR_DB_PASS}
+      ALDAR_DB_BASE: ${ALDAR_DB_BASE}
+      ALDAR_HOST: ${ALDAR_HOST:-0.0.0.0}  # Use .env value, default to 0.0.0.0 for Docker
+      ALDAR_PORT: ${ALDAR_PORT:-8080}  # Use .env value, default to 8080
+      ALDAR_REDIS_HOST: ${ALDAR_REDIS_HOST:-aldar-redis-cache.redis.cache.windows.net}
+      ALDAR_REDIS_PORT: ${ALDAR_REDIS_PORT:-6380}
+      ALDAR_REDIS_SSL: ${ALDAR_REDIS_SSL:-true}
+      # Let settings.py auto-detect Azure Redis and use rediss:// with SSL
+      # ALDAR_CELERY_BROKER_URL: ${ALDAR_CELERY_BROKER_URL}
+      # ALDAR_CELERY_RESULT_BACKEND: ${ALDAR_CELERY_RESULT_BACKEND}
+      ALDAR_REDIS_CONNECTION_STRING: aldar-redis-cache.redis.cache.windows.net:6380,password=${ALDAR_REDIS_PASSWORD},ssl=True,abortConnect=False
+      ALDAR_REDIS_PASSWORD: ${ALDAR_REDIS_PASSWORD}
+      ALDAR_SERVICE_BUS_CONNECTION_STRING: ${ALDAR_SERVICE_BUS_CONNECTION_STRING}
+      ALDAR_SERVICE_BUS_QUEUE_NAME: aldar-queue
+      # Prometheus Metrics Collection (local)
+      ALDAR_PROMETHEUS_ENABLED: ${ALDAR_PROMETHEUS_ENABLED:-false}
+      # Azure Managed Services (from .env)
+      ALDAR_AZURE_PROMETHEUS_ENABLED: ${ALDAR_AZURE_PROMETHEUS_ENABLED:-false}
+      ALDAR_AZURE_PROMETHEUS_ENDPOINT: ${ALDAR_AZURE_PROMETHEUS_ENDPOINT}
+      ALDAR_AZURE_PROMETHEUS_WORKSPACE_ID: ${ALDAR_AZURE_PROMETHEUS_WORKSPACE_ID}
+      AZURE_PROMETHEUS_PASSWORD: ${AZURE_PROMETHEUS_PASSWORD}
+      ALDAR_AZURE_GRAFANA_ENABLED: ${ALDAR_AZURE_GRAFANA_ENABLED:-false}
+      ALDAR_AZURE_GRAFANA_ENDPOINT: ${ALDAR_AZURE_GRAFANA_ENDPOINT}
+      ALDAR_AZURE_GRAFANA_API_KEY: ${ALDAR_AZURE_GRAFANA_API_KEY}
+      ALDAR_COSMOS_ENDPOINT: ${ALDAR_COSMOS_ENDPOINT}
+      ALDAR_COSMOS_KEY: ${ALDAR_COSMOS_KEY}
+      ALDAR_COSMOS_DATABASE_NAME: ${ALDAR_COSMOS_DATABASE_NAME:-aldar_memory}
+      ALDAR_COSMOS_CONTAINER_NAME: ${ALDAR_COSMOS_CONTAINER_NAME:-conversations}
+      ALDAR_COSMOS_LOGGING_ENABLED: ${ALDAR_COSMOS_LOGGING_ENABLED:-true}
+      ALDAR_COSMOS_LOGGING_DATABASE_NAME: ${ALDAR_COSMOS_LOGGING_DATABASE_NAME:-aldar-database}
+      ALDAR_COSMOS_LOGGING_CONTAINER_NAME: ${ALDAR_COSMOS_LOGGING_CONTAINER_NAME:-aldar-log}
+    ports:
+      - "${ALDAR_PORT:-8080}:${ALDAR_PORT:-8080}"  # Use .env port value
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:$$ALDAR_PORT/api/v1/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Celery Worker
+  celery-worker:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.worker
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    image: aldar-middleware-worker:${ALDAR_VERSION:-latest}
+    pull_policy: build
+    restart: always
+    env_file:
+      - .env
+    # depends_on:
+    #   db:
+    #     condition: service_healthy
+    environment:
+      # Use database credentials from .env file (Azure DB or other)
+      ALDAR_DB_HOST: ${ALDAR_DB_HOST}
+      ALDAR_DB_PORT: ${ALDAR_DB_PORT}
+      ALDAR_DB_USER: ${ALDAR_DB_USER}
+      ALDAR_DB_PASS: ${ALDAR_DB_PASS}
+      ALDAR_DB_BASE: ${ALDAR_DB_BASE}
+      ALDAR_REDIS_HOST: ${ALDAR_REDIS_HOST:-aldar-redis-cache.redis.cache.windows.net}
+      ALDAR_REDIS_PORT: ${ALDAR_REDIS_PORT:-6380}
+      ALDAR_REDIS_SSL: ${ALDAR_REDIS_SSL:-true}
+      # Let settings.py auto-detect Azure Redis and use rediss:// with SSL
+      # ALDAR_CELERY_BROKER_URL: ${ALDAR_CELERY_BROKER_URL}
+      # ALDAR_CELERY_RESULT_BACKEND: ${ALDAR_CELERY_RESULT_BACKEND}
+      ALDAR_REDIS_CONNECTION_STRING: aldar-redis-cache.redis.cache.windows.net:6380,password=${ALDAR_REDIS_PASSWORD},ssl=True,abortConnect=False
+      ALDAR_REDIS_PASSWORD: ${ALDAR_REDIS_PASSWORD}
+      ALDAR_SERVICE_BUS_CONNECTION_STRING: ${ALDAR_SERVICE_BUS_CONNECTION_STRING}
+      ALDAR_SERVICE_BUS_QUEUE_NAME: aldar-queue
+      CELERY_WORKER_CONCURRENCY: 4
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "celery", "-A", "aldar_middleware.queue.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Celery Beat Scheduler
+  celery-beat:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.beat
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    image: aldar-middleware-beat:${ALDAR_VERSION:-latest}
+    pull_policy: build
+    restart: always
+    env_file:
+      - .env
+    # depends_on:
+    #   db:
+    #     condition: service_healthy
+    environment:
+      # Use database credentials from .env file (Azure DB or other)
+      ALDAR_DB_HOST: ${ALDAR_DB_HOST}
+      ALDAR_DB_PORT: ${ALDAR_DB_PORT}
+      ALDAR_DB_USER: ${ALDAR_DB_USER}
+      ALDAR_DB_PASS: ${ALDAR_DB_PASS}
+      ALDAR_DB_BASE: ${ALDAR_DB_BASE}
+      ALDAR_REDIS_HOST: ${ALDAR_REDIS_HOST:-aldar-redis-cache.redis.cache.windows.net}
+      ALDAR_REDIS_PORT: ${ALDAR_REDIS_PORT:-6380}
+      ALDAR_REDIS_SSL: ${ALDAR_REDIS_SSL:-true}
+      # Let settings.py auto-detect Azure Redis and use rediss:// with SSL
+      # ALDAR_CELERY_BROKER_URL: ${ALDAR_CELERY_BROKER_URL}
+      # ALDAR_CELERY_RESULT_BACKEND: ${ALDAR_CELERY_RESULT_BACKEND}
+      ALDAR_REDIS_CONNECTION_STRING: aldar-redis-cache.redis.cache.windows.net:6380,password=${ALDAR_REDIS_PASSWORD},ssl=True,abortConnect=False
+      ALDAR_REDIS_PASSWORD: ${ALDAR_REDIS_PASSWORD}
+      ALDAR_SERVICE_BUS_CONNECTION_STRING: ${ALDAR_SERVICE_BUS_CONNECTION_STRING}
+      ALDAR_SERVICE_BUS_QUEUE_NAME: aldar-queue
+      # Azure Managed Services (from .env)
+      ALDAR_AZURE_PROMETHEUS_ENABLED: ${ALDAR_AZURE_PROMETHEUS_ENABLED:-false}
+      ALDAR_AZURE_GRAFANA_ENABLED: ${ALDAR_AZURE_GRAFANA_ENABLED:-false}
+      ALDAR_COSMOS_ENDPOINT: ${ALDAR_COSMOS_ENDPOINT}
+      ALDAR_COSMOS_KEY: ${ALDAR_COSMOS_KEY}
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "celery", "-A", "aldar_middleware.queue.celery_app", "inspect", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Celery Flower Monitoring
+  celery-flower:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.flower
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    image: aldar-middleware-flower:${ALDAR_VERSION:-latest}
+    pull_policy: build
+    restart: always
+    env_file:
+      - .env
+    # depends_on:
+    #   redis:
+    #     condition: service_healthy
+    environment:
+      ALDAR_REDIS_HOST: ${ALDAR_REDIS_HOST:-aldar-redis-cache.redis.cache.windows.net}
+      ALDAR_REDIS_PORT: ${ALDAR_REDIS_PORT:-6380}
+      ALDAR_REDIS_SSL: ${ALDAR_REDIS_SSL:-true}
+      # Let settings.py auto-detect Azure Redis and use rediss:// with SSL
+      # ALDAR_CELERY_BROKER_URL: ${ALDAR_CELERY_BROKER_URL}
+      # ALDAR_CELERY_RESULT_BACKEND: ${ALDAR_CELERY_RESULT_BACKEND}
+      ALDAR_REDIS_CONNECTION_STRING: aldar-redis-cache.redis.cache.windows.net:6380,password=${ALDAR_REDIS_PASSWORD},ssl=True,abortConnect=False
+      ALDAR_REDIS_PASSWORD: ${ALDAR_REDIS_PASSWORD}
+      ALDAR_SERVICE_BUS_CONNECTION_STRING: ${ALDAR_SERVICE_BUS_CONNECTION_STRING}
+      ALDAR_SERVICE_BUS_QUEUE_NAME: aldar-queue
+      # Azure Managed Services (from .env)
+      ALDAR_AZURE_PROMETHEUS_ENABLED: ${ALDAR_AZURE_PROMETHEUS_ENABLED:-false}
+      ALDAR_AZURE_GRAFANA_ENABLED: ${ALDAR_AZURE_GRAFANA_ENABLED:-false}
+      ALDAR_COSMOS_ENDPOINT: ${ALDAR_COSMOS_ENDPOINT}
+      ALDAR_COSMOS_KEY: ${ALDAR_COSMOS_KEY}
+    ports:
+      - "5555:5555"
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5555"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Local PostgreSQL Container - Uses .env database credentials
+  db:
+    image: postgres:15-alpine
+    hostname: aiq-db
+    env_file:
+      - .env
+    environment:
+      POSTGRES_PASSWORD: ${ALDAR_DB_PASS}
+      POSTGRES_USER: ${ALDAR_DB_USER}
+      POSTGRES_DB: ${ALDAR_DB_BASE}
+    volumes:
+      - aiq-db-data:/var/lib/postgresql/data
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${ALDAR_DB_USER} -d postgres"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    ports:
+      - "5432:5432"
+
+  migrator:
+    build:
+      context: .
+      dockerfile: ./Dockerfile.main
+      platforms:
+        - linux/amd64
+        - linux/arm64
+    image: aldar-middleware-main:${ALDAR_VERSION:-latest}
+    pull_policy: build
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    env_file:
+      - .env
+    environment:
+      # Use database credentials from .env file (Azure DB or other)
+      ALDAR_DB_HOST: ${ALDAR_DB_HOST}
+      ALDAR_DB_PORT: ${ALDAR_DB_PORT}
+      ALDAR_DB_USER: ${ALDAR_DB_USER}
+      ALDAR_DB_PASS: ${ALDAR_DB_PASS}
+      ALDAR_DB_BASE: ${ALDAR_DB_BASE}
+    # depends_on:
+    #   db:
+    #     condition: service_healthy
+
+  # Redis - Using Azure Redis Cache instead of local Redis
+  # redis:
+  #   image: redis:7-alpine
+  #   hostname: "aiq-redis"
+  #   restart: always
+  #   command: redis-server --appendonly yes
+  #   healthcheck:
+  #     test: redis-cli ping
+  #     interval: 1s
+  #     timeout: 3s
+  #     retries: 50
+  #   ports:
+  #     - "6379:6379"
+    # volumes:
+    #   - redis-data:/data
+
+  # Prometheus Container - connects to Azure Managed Prometheus via remote_write when configured in .env
+  # Use local Prometheus for metrics collection and viewing logs
+  # Remote write to Azure is configured in monitoring/prometheus.yml based on .env values
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: aiq-prometheus
+    restart: always
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    environment:
+      # Azure Prometheus credentials from .env (optional - only if remote_write enabled)
+      AZURE_PROMETHEUS_PASSWORD: ${AZURE_PROMETHEUS_PASSWORD}
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+
+  # Local Grafana instance for development/dashboard viewing
+  grafana:
+    image: grafana/grafana:latest
+    container_name: aiq-grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=admin
+      # Configure Prometheus datasource
+      - GF_PROMETHEUS_PASSWORD=${AZURE_PROMETHEUS_PASSWORD:-}
+      # Force Grafana to listen on all interfaces (IPv4 and IPv6)
+      - GF_SERVER_HTTP_ADDR=0.0.0.0
+      - GF_SERVER_PROTOCOL=http
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+
+volumes:
+  aiq-db-data:
+    name: aiq-db-data
+  # redis-data:
+  #   name: aiq-redis-data
+  prometheus-data:
+    name: aiq-prometheus-data
+  grafana-data:
+    name: aiq-grafana-data

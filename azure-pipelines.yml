@@ -1,0 +1,961 @@
+# Azure DevOps BUILD Pipeline
+# Builds Docker images and pushes to ACR
+# Deploy to AKS happens in Release Pipeline
+ 
+trigger:
+  branches:
+    include:
+      - develop
+      - uat1
+      - uat2
+      - main
+  paths:
+    exclude:
+      - README.md
+      - '*.md'
+      - docs/*
+
+pr:
+  branches:
+    include:
+      - develop
+      - uat1
+      - uat2
+      - main
+  paths:
+    exclude:
+      - README.md
+      - '*.md'
+      - docs/*
+
+# ---------------------------------------------------------
+# PATCH counter – increments ONLY for same MAJOR.MINOR
+# This should be used only when branch = develop
+# ---------------------------------------------------------
+
+variables:
+  - group: aldar-middleware-variables
+  - name: PATCH
+    value: $[counter(format('{0}.{1}', variables['SEMVER_MAJOR'], variables['SEMVER_MINOR']), 0)]
+ 
+stages:
+- stage: Test
+  displayName: Run Tests
+  jobs:
+  - job: Test
+    displayName: Run Tests
+    pool:
+      name: AI-Orchestration-pool
+      vmImage: $(vmImageName)
+    
+    steps:
+    - checkout: self
+    
+    - task: Bash@3
+      displayName: 'Install Poetry'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+ 
+          # Install Poetry
+          curl -sSL https://install.python-poetry.org | python3 -
+ 
+          # Add Poetry to PATH
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "##vso[task.prependpath]$HOME/.local/bin"
+ 
+          # Verify installation
+          poetry --version
+   
+    - task: Bash@3
+      displayName: 'Install Dependencies with Poetry (virtualenv)'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Remove config that causes install into system python
+          poetry config --unset virtualenvs.create
+          poetry install --no-interaction --no-root --with dev
+        
+    - task: Bash@3
+      displayName: 'Run Tests'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+ 
+          # Ensure project root is on PYTHONPATH so your package can be imported
+          export PYTHONPATH=$(pwd)
+          echo "PYTHONPATH=$PYTHONPATH"
+ 
+          # Debug: show import path and check package import
+          poetry run python -c "import sys; print('sys.path =', sys.path)"
+          poetry run python -c "import aldar_middleware; print('aldar_middleware import OK:', aldar_middleware)"
+ 
+          # Run pytest via python -m pytest (safer for import paths)
+          poetry run python -m pytest tests/ -v --cov=aldar_middleware --cov-report=xml --cov-report=html --junitxml=junit.xml
+      continueOnError: true
+ 
+    - task: PublishTestResults@2
+      displayName: 'Publish Test Results'
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/junit.xml'
+        testRunTitle: 'Test Results'
+      condition: always()
+ 
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publish Code Coverage'
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/coverage.xml'
+        pathToSources: '$(Build.SourcesDirectory)'
+      condition: always()
+
+- stage: Build
+  displayName: Build Docker Image
+  dependsOn: Test
+  condition: succeeded()
+  variables:
+  - group: aio-dev-devops
+  - group: aldar-middleware-variables
+  jobs:
+  - job: Build
+    displayName: Build & Push Image
+    pool:
+      name: AI-Orchestration-pool
+      vmImage: ubuntu-latest
+    steps:
+    - checkout: self
+
+    # -----------------------------------------------------
+    # Resolve semantic version & image tag (timestamp-safe)
+    # -----------------------------------------------------
+    - bash: |
+        set -euo pipefail
+
+        echo "==> Logging in to Azure..."
+        az login --service-principal \
+          -u $(DEPLOYER_CLIENT_ID) \
+          -p $(DEPLOYER_CLIENT_SECRET) \
+          --tenant $(TENANT_ID) >/dev/null
+
+        echo "==> Login to ACR..."
+        az acr login --name $(ACR_NAME) >/dev/null
+
+        REPO="$(imageRepository)"
+
+        get_latest_tag_by_suffix () {
+          local suffix="$1"
+          az acr repository show-manifests \
+            --name $(ACR_NAME) \
+            --repository "$REPO" \
+            --query "reverse(sort_by([?tags[?ends_with(@,'$suffix')]], &timestamp))[0].tags[0]" \
+            -o tsv
+        }
+
+        BRANCH="$(Build.SourceBranchName)"
+        echo "==> Branch detected: $BRANCH"
+
+        if [ "$BRANCH" = "develop" ]; then
+          VERSION="$(SEMVER_MAJOR).$(SEMVER_MINOR).$(PATCH)"
+          IMAGE_TAG="$VERSION-dev"
+
+        elif [ "$BRANCH" = "uat1" ]; then
+          DEV_TAG="$(get_latest_tag_by_suffix '-dev')"
+          if [ -z "$DEV_TAG" ]; then
+            echo "ERROR: No DEV tags found in ACR."
+            exit 1
+          fi
+          VERSION="${DEV_TAG%-dev}"
+          IMAGE_TAG="$VERSION-uat1"
+
+        elif [ "$BRANCH" = "uat2" ]; then
+          UAT1_TAG="$(get_latest_tag_by_suffix '-uat1')"
+          if [ -z "$UAT1_TAG" ]; then
+            echo "ERROR: No UAT1 tags found in ACR."
+            exit 1
+          fi
+          VERSION="${UAT1_TAG%-uat1}"
+          IMAGE_TAG="$VERSION-uat2"
+
+        elif [ "$BRANCH" = "main" ]; then
+          UAT2_TAG="$(get_latest_tag_by_suffix '-uat2')"
+          if [ -z "$UAT2_TAG" ]; then
+            echo "ERROR: No UAT2 tags found in ACR."
+            exit 1
+          fi
+          VERSION="${UAT2_TAG%-uat2}"
+          IMAGE_TAG="$VERSION-prod"
+
+        else
+          echo "ERROR: Unsupported branch: $BRANCH"
+          exit 1
+        fi
+
+        echo "==> Resolved IMAGE_TAG=$IMAGE_TAG"
+        IMAGE_TAG="$(echo "$IMAGE_TAG" | tr -d '\r\n')"
+        echo "##vso[task.setvariable variable=IMAGE_TAG]$IMAGE_TAG"
+        echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$IMAGE_TAG"
+      name: SetImageTag
+      displayName: Resolve semantic version (timestamp-safe)
+    
+    # - task: Docker@2
+    #   displayName: 'Build and Push Main Application'
+    #   inputs:
+    #     containerRegistry: $(dockerRegistryServiceConnection)
+    #     repository: $(imageRepository)-main
+    #     command: buildAndPush
+    #     Dockerfile: Dockerfile.main
+    #     tags: |
+    #       $(IMAGE_TAG)
+    
+    # - task: Docker@2
+    #   displayName: 'Build and Push Worker'
+    #   inputs:
+    #     containerRegistry: $(dockerRegistryServiceConnection)
+    #     repository: $(imageRepository)-worker
+    #     command: buildAndPush
+    #     Dockerfile: Dockerfile.worker
+    #     tags: |
+    #       $(IMAGE_TAG)      
+
+    # - task: Docker@2
+    #   displayName: 'Build and Push Beat'
+    #   inputs:
+    #     containerRegistry: $(dockerRegistryServiceConnection)
+    #     repository: $(imageRepository)-beat
+    #     command: buildAndPush
+    #     Dockerfile: Dockerfile.beat
+    #     tags: |
+    #       $(IMAGE_TAG)
+    
+    # - task: Docker@2
+    #   displayName: 'Build and Push Flower'
+    #   inputs:
+    #     containerRegistry: $(dockerRegistryServiceConnection)
+    #     repository: $(imageRepository)-flower
+    #     command: buildAndPush
+    #     Dockerfile: Dockerfile.flower
+    #     tags: |
+    #       $(IMAGE_TAG)
+
+
+    - bash: |
+        set -euo pipefail
+
+        echo "==> Logging in to Azure..."
+        az login --service-principal \
+          -u "${DEPLOYER_CLIENT_ID}" \
+          -p "${DEPLOYER_CLIENT_SECRET}" \
+          --tenant "${TENANT_ID}" >/dev/null
+
+        echo "==> Login to ACR..."
+        az acr login --name "${ACR_NAME}" >/dev/null
+        
+        echo "==> Build and Push Backend Main..."
+        MAIN_IMAGE="${ACR_NAME}.azurecr.io/${imageRepository}-main:${IMAGE_TAG}"
+        docker build -f Dockerfile.main -t "${MAIN_IMAGE}" .
+        docker push "${MAIN_IMAGE}"
+        
+        echo "==> Build and Push Backend Worker..."
+        WORKER_IMAGE="${ACR_NAME}.azurecr.io/${imageRepository}-worker:${IMAGE_TAG}"
+        docker build -f Dockerfile.worker -t "${WORKER_IMAGE}" .
+        docker push "${WORKER_IMAGE}"
+
+        echo "==> Build and Push Backend Beat..."
+        BEAT_IMAGE="${ACR_NAME}.azurecr.io/${imageRepository}-beat:${IMAGE_TAG}"
+        docker build -f Dockerfile.beat -t "${BEAT_IMAGE}" .
+        docker push "${BEAT_IMAGE}"
+
+        echo "==> Build and Push Backend Flower..."
+        FLOWER_IMAGE="${ACR_NAME}.azurecr.io/${imageRepository}-flower:${IMAGE_TAG}"
+        docker build -f Dockerfile.flower -t "${FLOWER_IMAGE}" .
+        docker push "${FLOWER_IMAGE}"
+      env:
+        DEPLOYER_CLIENT_ID: $(DEPLOYER_CLIENT_ID)
+        DEPLOYER_CLIENT_SECRET: $(DEPLOYER_CLIENT_SECRET)
+        TENANT_ID: $(TENANT_ID)
+        ACR_NAME: $(ACR_NAME)
+        imageRepository: $(imageRepository)
+        IMAGE_TAG: $(IMAGE_TAG)
+      displayName: Build and Push Images
+
+
+    - task: Bash@3
+      displayName: 'Output Build Artifacts'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "##vso[task.setvariable variable=ImageTag]$(IMAGE_TAG)"
+          echo "##vso[task.setvariable variable=ImageRepository]$(imageRepository)"
+          echo "##vso[task.setvariable variable=ContainerRegistry]$(containerRegistry)"
+          echo "Built images:"
+          echo "- $(containerRegistry)/$(imageRepository)-main:$(IMAGE_TAG)"
+          # echo "- $(containerRegistry)/$(imageRepository)-worker:$(IMAGE_TAG)"
+          # echo "- $(containerRegistry)/$(imageRepository)-beat:$(IMAGE_TAG)"
+          # echo "- $(containerRegistry)/$(imageRepository)-flower:$(IMAGE_TAG)"
+
+# ========================= Deploy to DEV AKS =========================
+- stage: Deploy_Dev
+  displayName: Deploy to DEV AKS
+  dependsOn: Build
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/develop')
+  variables:
+  - group: aio-dev-devops
+  - name: IMAGE_TAG
+    value: $[ stageDependencies.Build.Build.outputs['SetImageTag.IMAGE_TAG'] ]
+  jobs:
+  - job: DevDeploy
+    displayName: DEV Deployment Job
+    pool:
+      name: 'AI-Orchestration-pool'
+    steps:
+ 
+    - task: Bash@3
+      displayName: "Deploy to DEV AKS"
+      env:
+        SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)
+        TENANT_ID: $(TENANT_ID)
+        DEPLOYER_CLIENT_ID: $(DEPLOYER_CLIENT_ID)
+        DEPLOYER_CLIENT_SECRET: $(DEPLOYER_CLIENT_SECRET)
+        AKS_RESOURCE_GROUP: $(AKS_RESOURCE_GROUP)        
+        AKS_NAME: $(AKS_NAME)
+        BE_NS: $(BE_NS)
+        BE_DEPLOYMENT: $(BE_DEPLOYMENT)        
+        BE_CONTAINER: $(BE_CONTAINER)
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+        BE_IMAGE_REPO: $(BE_IMAGE_REPO)
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+ 
+          echo "==> Logging in to Azure using Service Principal"
+          az login --service-principal \
+            --username "${DEPLOYER_CLIENT_ID}" \
+            --password "${DEPLOYER_CLIENT_SECRET}" \
+            --tenant   "${TENANT_ID}" >/dev/null
+ 
+          echo "==> Setting subscription..."
+          az account set --subscription "${SUBSCRIPTION_ID}"
+
+          echo "==> Show Azure subscription..."
+          az account show -o table
+
+          echo "==> Getting AKS kubeconfig..."
+          az aks get-credentials \
+            --resource-group "${AKS_RESOURCE_GROUP}" \
+            --name "${AKS_NAME}" \
+            --overwrite-existing
+          
+          echo "Deploy Backend Main image into AKS..."
+          kubectl -n $(BE_NS) set image deployment/$(BE_DEPLOYMENT) \
+            $(BE_CONTAINER)=$(ACR_LOGIN_SERVER)/$(BE_IMAGE_REPO):$(IMAGE_TAG)
+
+
+          echo "Waiting for rollout..."
+          kubectl -n $(BE_NS) rollout restart deployment/$(BE_DEPLOYMENT)
+          kubectl -n $(BE_NS) rollout status deployment/$(BE_DEPLOYMENT)
+
+          echo "Deploy Backend Worker image into AKS..."
+          kubectl -n $(BE_NS) set image deployment/$(WORKER_DEPLOYMENT) \
+            $(WORKER_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(WORKER_DEPLOYMENT):$(IMAGE_TAG)
+          
+          echo "Deploy Backend Beat image into AKS..."
+          kubectl -n $(BE_NS) set image deployment/$(BEAT_DEPLOYMENT) \
+            $(BEAT_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(BEAT_DEPLOYMENT):$(IMAGE_TAG)
+
+          echo "Deploy Backend Flower image into AKS..."
+          kubectl -n $(BE_NS) set image deployment/$(FLOWER_DEPLOYMENT) \
+            $(FLOWER_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(FLOWER_DEPLOYMENT):$(IMAGE_TAG)
+
+          echo "Celery rollout..."
+          kubectl -n $(BE_NS) scale deployment $(WORKER_DEPLOYMENT) --replicas=0
+          kubectl -n $(BE_NS) scale deployment $(BEAT_DEPLOYMENT) --replicas=0
+          kubectl -n $(BE_NS) scale deployment $(FLOWER_DEPLOYMENT) --replicas=0
+          sleep 120
+          kubectl -n $(BE_NS) scale deployment $(WORKER_DEPLOYMENT) --replicas=1
+          kubectl -n $(BE_NS) scale deployment $(BEAT_DEPLOYMENT) --replicas=1
+          kubectl -n $(BE_NS) scale deployment $(FLOWER_DEPLOYMENT) --replicas=1
+
+    - task: Bash@3
+      displayName: "Run DB Schema Migrations"
+      env:
+        SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)
+        TENANT_ID: $(TENANT_ID)
+        DEPLOYER_CLIENT_ID: $(DEPLOYER_CLIENT_ID)
+        DEPLOYER_CLIENT_SECRET: $(DEPLOYER_CLIENT_SECRET)
+        AKS_RESOURCE_GROUP: $(AKS_RESOURCE_GROUP)        
+        AKS_NAME: $(AKS_NAME)
+        BE_NS: $(BE_NS)
+        BE_DEPLOYMENT: $(BE_DEPLOYMENT)        
+        BE_CONTAINER: $(BE_CONTAINER)
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+        BE_IMAGE_REPO: $(BE_IMAGE_REPO)
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+          
+          echo "==> Logging in to Azure using Service Principal"
+          az login --service-principal \
+            --username "${DEPLOYER_CLIENT_ID}" \
+            --password "${DEPLOYER_CLIENT_SECRET}" \
+            --tenant   "${TENANT_ID}" >/dev/null
+          
+          echo "==> Setting subscription..."
+          
+          az account set --subscription "${SUBSCRIPTION_ID}"
+          
+          echo "==> Getting AKS kubeconfig..."
+          
+          az aks get-credentials \
+            --resource-group "${AKS_RESOURCE_GROUP}" \
+            --name "${AKS_NAME}" \
+            --overwrite-existing
+          
+          echo "==> Running database migrations..."
+          # Create a Kubernetes Job to run migrations
+          # Delete any existing migration job first
+          
+          kubectl -n $(BE_NS) delete job aldar-middleware-migration --ignore-not-found=true || true
+          # Wait for job to be fully deleted
+          sleep 5
+          # Create migration job
+          cat <<EOF | kubectl -n $(BE_NS) apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: aldar-middleware-migration
+            namespace: $(BE_NS)
+          spec:
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                - name: migration
+                  image: $(ACR_LOGIN_SERVER)/$(BE_IMAGE_REPO):$(IMAGE_TAG)
+                  command: ["alembic", "upgrade", "head"]
+            backoffLimit: 3
+          EOF
+          echo "==> Waiting for migration job to complete..."
+          # Wait for job to complete (timeout after 10 minutes)
+          if kubectl -n $(BE_NS) wait --for=condition=complete --timeout=600s job/aldar-middleware-migration; then
+            echo "✅ Migrations completed successfully!"
+            # Get migration logs
+            kubectl -n $(BE_NS) logs job/aldar-middleware-migration
+            # Clean up the job
+            kubectl -n $(BE_NS) delete job aldar-middleware-migration || true
+          else
+            echo "❌ Migration job failed or timed out!"
+            # Get logs for debugging
+            kubectl -n $(BE_NS) logs job/aldar-middleware-migration || true
+            # Clean up the job
+            kubectl -n $(BE_NS) delete job aldar-middleware-migration || true
+            exit 1
+          fi
+
+# ========================= Deploy to UAT1 AKS =========================
+- stage: Deploy_UAT1
+  displayName: Deploy to UAT1 AKS
+  dependsOn: Build
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/uat1')
+  variables:
+  - group: aio-uat1-devops
+  - name: IMAGE_TAG
+    value: $[ stageDependencies.Build.Build.outputs['SetImageTag.IMAGE_TAG'] ]  
+  jobs:
+  - job: UATDeploy
+    displayName: UAT Deployment Job
+    pool:
+      name: 'AI-Orchestration-uat-pool'
+    steps:
+ 
+    - task: Bash@3
+      displayName: "Deploy to UAT1 AKS"
+      env:
+        SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)
+        TENANT_ID: $(TENANT_ID)
+        DEPLOYER_CLIENT_ID: $(DEPLOYER_CLIENT_ID)
+        DEPLOYER_CLIENT_SECRET: $(DEPLOYER_CLIENT_SECRET)
+        AKS_RESOURCE_GROUP: $(AKS_RESOURCE_GROUP)        
+        AKS_NAME: $(AKS_NAME)
+        BE_NS: $(BE_NS)
+        BE_DEPLOYMENT: $(BE_DEPLOYMENT)        
+        BE_CONTAINER: $(BE_CONTAINER)
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+        BE_IMAGE_REPO: $(BE_IMAGE_REPO)
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+ 
+          echo "==> Logging in to Azure using Service Principal"
+          az login --service-principal \
+            --username "${DEPLOYER_CLIENT_ID}" \
+            --password "${DEPLOYER_CLIENT_SECRET}" \
+            --tenant   "${TENANT_ID}" >/dev/null
+ 
+          echo "==> Setting subscription..."
+          az account set --subscription "${SUBSCRIPTION_ID}"
+
+          echo "==> Show Azure subscription..."
+          az account show -o table
+
+          echo "==> Getting AKS kubeconfig..."
+          az aks get-credentials \
+            --resource-group "${AKS_RESOURCE_GROUP}" \
+            --name "${AKS_NAME}" \
+            --overwrite-existing
+                    
+          echo "==> Converting kubeconfig for SP non-interactive auth"
+          kubelogin convert-kubeconfig -l azurecli
+
+          echo "Setting image in Kubernetes..."
+          kubectl -n $(BE_NS) set image deployment/$(BE_DEPLOYMENT) \
+            $(BE_CONTAINER)=$(ACR_LOGIN_SERVER)/$(BE_IMAGE_REPO):$(IMAGE_TAG)
+
+          echo "Waiting for rollout..."
+          kubectl -n $(BE_NS) rollout restart deployment/$(BE_DEPLOYMENT)
+          kubectl -n $(BE_NS) rollout status deployment/$(BE_DEPLOYMENT)
+
+          echo "Deploy Backend Worker image into AKS..."
+          kubectl -n $(BE_NS) set image deployment/$(WORKER_DEPLOYMENT) \
+            $(WORKER_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(WORKER_DEPLOYMENT):$(IMAGE_TAG)
+          
+          echo "Deploy Backend Beat image into AKS..."
+          kubectl -n $(BE_NS) set image deployment/$(BEAT_DEPLOYMENT) \
+            $(BEAT_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(BEAT_DEPLOYMENT):$(IMAGE_TAG)
+
+          echo "Deploy Backend Flower image into AKS..."
+          kubectl -n $(BE_NS) set image deployment/$(FLOWER_DEPLOYMENT) \
+            $(FLOWER_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(FLOWER_DEPLOYMENT):$(IMAGE_TAG)
+
+          echo "Celery rollout..."
+          kubectl -n $(BE_NS) scale deployment $(WORKER_DEPLOYMENT) --replicas=0
+          kubectl -n $(BE_NS) scale deployment $(BEAT_DEPLOYMENT) --replicas=0
+          kubectl -n $(BE_NS) scale deployment $(FLOWER_DEPLOYMENT) --replicas=0
+          sleep 120
+          kubectl -n $(BE_NS) scale deployment $(WORKER_DEPLOYMENT) --replicas=1
+          kubectl -n $(BE_NS) scale deployment $(BEAT_DEPLOYMENT) --replicas=1
+          kubectl -n $(BE_NS) scale deployment $(FLOWER_DEPLOYMENT) --replicas=1
+
+
+    - task: Bash@3
+      displayName: "Run DB Schema Migrations"
+      env:
+        SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)
+        TENANT_ID: $(TENANT_ID)
+        DEPLOYER_CLIENT_ID: $(DEPLOYER_CLIENT_ID)
+        DEPLOYER_CLIENT_SECRET: $(DEPLOYER_CLIENT_SECRET)
+        AKS_RESOURCE_GROUP: $(AKS_RESOURCE_GROUP)        
+        AKS_NAME: $(AKS_NAME)
+        BE_NS: $(BE_NS)
+        BE_DEPLOYMENT: $(BE_DEPLOYMENT)        
+        BE_CONTAINER: $(BE_CONTAINER)
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+        BE_IMAGE_REPO: $(BE_IMAGE_REPO)
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+          
+          echo "==> Logging in to Azure using Service Principal"
+          az login --service-principal \
+            --username "${DEPLOYER_CLIENT_ID}" \
+            --password "${DEPLOYER_CLIENT_SECRET}" \
+            --tenant   "${TENANT_ID}" >/dev/null
+          
+          echo "==> Setting subscription..."
+          
+          az account set --subscription "${SUBSCRIPTION_ID}"
+          
+          echo "==> Getting AKS kubeconfig..."
+          
+          az aks get-credentials \
+            --resource-group "${AKS_RESOURCE_GROUP}" \
+            --name "${AKS_NAME}" \
+            --overwrite-existing
+
+          echo "==> Converting kubeconfig for SP non-interactive auth"
+          kubelogin convert-kubeconfig -l azurecli            
+          
+          echo "==> Running database migrations..."
+          # Create a Kubernetes Job to run migrations
+          # Delete any existing migration job first
+          
+          kubectl -n $(BE_NS) delete job aldar-middleware-migration --ignore-not-found=true || true
+          # Wait for job to be fully deleted
+          sleep 5
+          # Create migration job
+          cat <<EOF | kubectl -n $(BE_NS) apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: aldar-middleware-migration
+            namespace: $(BE_NS)
+          spec:
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                - name: migration
+                  image: $(ACR_LOGIN_SERVER)/$(BE_IMAGE_REPO):$(IMAGE_TAG)
+                  command: ["alembic", "upgrade", "head"]
+            backoffLimit: 3
+          EOF
+          echo "==> Waiting for migration job to complete..."
+          # Wait for job to complete (timeout after 10 minutes)
+          if kubectl -n $(BE_NS) wait --for=condition=complete --timeout=600s job/aldar-middleware-migration; then
+            echo "✅ Migrations completed successfully!"
+            # Get migration logs
+            kubectl -n $(BE_NS) logs job/aldar-middleware-migration
+            # Clean up the job
+            kubectl -n $(BE_NS) delete job aldar-middleware-migration || true
+          else
+            echo "❌ Migration job failed or timed out!"
+            # Get logs for debugging
+            kubectl -n $(BE_NS) logs job/aldar-middleware-migration || true
+            # Clean up the job
+            kubectl -n $(BE_NS) delete job aldar-middleware-migration || true
+            exit 1
+          fi
+
+# ========================= Deploy to UAT2 AKS =========================
+- stage: Deploy_UAT2
+  displayName: Deploy to UAT2 AKS
+  dependsOn: Build
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/uat2')
+  variables:
+  - group: aio-uat2-devops
+  - name: IMAGE_TAG
+    value: $[ stageDependencies.Build.Build.outputs['SetImageTag.IMAGE_TAG'] ]  
+  jobs:
+  - job: UAT2Deploy
+    displayName: UAT2 Deployment Job
+    pool:
+      name: 'AI-Orchestration-uat-pool'
+    steps:
+ 
+    - task: Bash@3
+      displayName: "Deploy to UAT2 AKS"
+      env:
+        SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)
+        TENANT_ID: $(TENANT_ID)
+        DEPLOYER_CLIENT_ID: $(DEPLOYER_CLIENT_ID)
+        DEPLOYER_CLIENT_SECRET: $(DEPLOYER_CLIENT_SECRET)
+        AKS_RESOURCE_GROUP: $(AKS_RESOURCE_GROUP)        
+        AKS_NAME: $(AKS_NAME)
+        BE_NS: $(BE_NS)
+        BE_DEPLOYMENT: $(BE_DEPLOYMENT)        
+        BE_CONTAINER: $(BE_CONTAINER)
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+        BE_IMAGE_REPO: $(BE_IMAGE_REPO)
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+ 
+          echo "==> Logging in to Azure using Service Principal"
+          az login --service-principal \
+            --username "${DEPLOYER_CLIENT_ID}" \
+            --password "${DEPLOYER_CLIENT_SECRET}" \
+            --tenant   "${TENANT_ID}" >/dev/null
+ 
+          echo "==> Setting subscription..."
+          az account set --subscription "${SUBSCRIPTION_ID}"
+
+          echo "==> Show Azure subscription..."
+          az account show -o table
+
+          echo "==> Getting AKS kubeconfig..."
+          az aks get-credentials \
+            --resource-group "${AKS_RESOURCE_GROUP}" \
+            --name "${AKS_NAME}" \
+            --overwrite-existing
+                    
+          echo "==> Converting kubeconfig for SP non-interactive auth"
+          kubelogin convert-kubeconfig -l azurecli
+
+          echo "Setting image in Kubernetes..."
+          kubectl -n $(BE_NS) set image deployment/$(BE_DEPLOYMENT) \
+            $(BE_CONTAINER)=$(ACR_LOGIN_SERVER)/$(BE_IMAGE_REPO):$(IMAGE_TAG)
+
+          echo "Waiting for rollout..."
+          kubectl -n $(BE_NS) rollout restart deployment/$(BE_DEPLOYMENT)
+          kubectl -n $(BE_NS) rollout status deployment/$(BE_DEPLOYMENT)
+
+          echo "Deploy Backend Worker image into AKS..."
+          kubectl -n $(BE_NS) set image deployment/$(WORKER_DEPLOYMENT) \
+            $(WORKER_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(WORKER_DEPLOYMENT):$(IMAGE_TAG)
+          
+          echo "Deploy Backend Beat image into AKS..."
+          kubectl -n $(BE_NS) set image deployment/$(BEAT_DEPLOYMENT) \
+            $(BEAT_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(BEAT_DEPLOYMENT):$(IMAGE_TAG)
+
+          echo "Deploy Backend Flower image into AKS..."
+          kubectl -n $(BE_NS) set image deployment/$(FLOWER_DEPLOYMENT) \
+            $(FLOWER_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(FLOWER_DEPLOYMENT):$(IMAGE_TAG)
+
+          echo "Celery rollout..."
+          kubectl -n $(BE_NS) scale deployment $(WORKER_DEPLOYMENT) --replicas=0
+          kubectl -n $(BE_NS) scale deployment $(BEAT_DEPLOYMENT) --replicas=0
+          kubectl -n $(BE_NS) scale deployment $(FLOWER_DEPLOYMENT) --replicas=0
+          sleep 120
+          kubectl -n $(BE_NS) scale deployment $(WORKER_DEPLOYMENT) --replicas=1
+          kubectl -n $(BE_NS) scale deployment $(BEAT_DEPLOYMENT) --replicas=1
+          kubectl -n $(BE_NS) scale deployment $(FLOWER_DEPLOYMENT) --replicas=1
+
+
+    - task: Bash@3
+      displayName: "Run DB Schema Migrations"
+      env:
+        SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)
+        TENANT_ID: $(TENANT_ID)
+        DEPLOYER_CLIENT_ID: $(DEPLOYER_CLIENT_ID)
+        DEPLOYER_CLIENT_SECRET: $(DEPLOYER_CLIENT_SECRET)
+        AKS_RESOURCE_GROUP: $(AKS_RESOURCE_GROUP)        
+        AKS_NAME: $(AKS_NAME)
+        BE_NS: $(BE_NS)
+        BE_DEPLOYMENT: $(BE_DEPLOYMENT)        
+        BE_CONTAINER: $(BE_CONTAINER)
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+        BE_IMAGE_REPO: $(BE_IMAGE_REPO)
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+          
+          echo "==> Logging in to Azure using Service Principal"
+          az login --service-principal \
+            --username "${DEPLOYER_CLIENT_ID}" \
+            --password "${DEPLOYER_CLIENT_SECRET}" \
+            --tenant   "${TENANT_ID}" >/dev/null
+          
+          echo "==> Setting subscription..."
+          
+          az account set --subscription "${SUBSCRIPTION_ID}"
+          
+          echo "==> Getting AKS kubeconfig..."
+          
+          az aks get-credentials \
+            --resource-group "${AKS_RESOURCE_GROUP}" \
+            --name "${AKS_NAME}" \
+            --overwrite-existing
+
+          echo "==> Converting kubeconfig for SP non-interactive auth"
+          kubelogin convert-kubeconfig -l azurecli            
+          
+          echo "==> Running database migrations..."
+          # Create a Kubernetes Job to run migrations
+          # Delete any existing migration job first
+          
+          kubectl -n $(BE_NS) delete job aldar-middleware-migration --ignore-not-found=true || true
+          # Wait for job to be fully deleted
+          sleep 5
+          # Create migration job
+          cat <<EOF | kubectl -n $(BE_NS) apply -f -
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: aldar-middleware-migration
+            namespace: $(BE_NS)
+          spec:
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                - name: migration
+                  image: $(ACR_LOGIN_SERVER)/$(BE_IMAGE_REPO):$(IMAGE_TAG)
+                  command: ["alembic", "upgrade", "head"]
+            backoffLimit: 3
+          EOF
+          echo "==> Waiting for migration job to complete..."
+          # Wait for job to complete (timeout after 10 minutes)
+          if kubectl -n $(BE_NS) wait --for=condition=complete --timeout=600s job/aldar-middleware-migration; then
+            echo "✅ Migrations completed successfully!"
+            # Get migration logs
+            kubectl -n $(BE_NS) logs job/aldar-middleware-migration
+            # Clean up the job
+            kubectl -n $(BE_NS) delete job aldar-middleware-migration || true
+          else
+            echo "❌ Migration job failed or timed out!"
+            # Get logs for debugging
+            kubectl -n $(BE_NS) logs job/aldar-middleware-migration || true
+            # Clean up the job
+            kubectl -n $(BE_NS) delete job aldar-middleware-migration || true
+            exit 1
+          fi
+
+# ========================= Deploy to PROD AKS =========================
+- stage: Deploy_Prod
+  displayName: Deploy to PROD AKS
+  dependsOn: Build
+  condition: eq(variables['Build.SourceBranch'], 'refs/heads/main')
+  variables:
+  - group: aio-prod-devops
+  - name: IMAGE_TAG
+    value: $[ stageDependencies.Build.Build.outputs['SetImageTag.IMAGE_TAG'] ]  
+
+  jobs:
+  - deployment: ProdDeploy
+    displayName: PROD Deployment Job
+    environment: prod-backend-aks
+    pool:
+      name: 'AI-Orchestration-uat-pool'
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - task: Bash@3
+            displayName: "Deploy to PROD AKS"
+            env:
+              SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)
+              TENANT_ID: $(TENANT_ID)
+              DEPLOYER_CLIENT_ID: $(DEPLOYER_CLIENT_ID)
+              DEPLOYER_CLIENT_SECRET: $(DEPLOYER_CLIENT_SECRET)
+              AKS_RESOURCE_GROUP: $(AKS_RESOURCE_GROUP)        
+              AKS_NAME: $(AKS_NAME)
+              BE_NS: $(BE_NS)
+              BE_DEPLOYMENT: $(BE_DEPLOYMENT)        
+              BE_CONTAINER: $(BE_CONTAINER)
+              ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+              BE_IMAGE_REPO: $(BE_IMAGE_REPO)
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+       
+                echo "==> Logging in to Azure using Service Principal"
+                az login --service-principal \
+                  --username "${DEPLOYER_CLIENT_ID}" \
+                  --password "${DEPLOYER_CLIENT_SECRET}" \
+                  --tenant   "${TENANT_ID}" >/dev/null
+       
+                echo "==> Setting subscription..."
+                az account set --subscription "${SUBSCRIPTION_ID}"
+      
+                echo "==> Show Azure subscription..."
+                az account show -o table
+      
+                echo "==> Getting AKS kubeconfig..."
+                az aks get-credentials \
+                  --resource-group "${AKS_RESOURCE_GROUP}" \
+                  --name "${AKS_NAME}" \
+                  --overwrite-existing
+      
+                echo "==> Converting kubeconfig for SP non-interactive auth"
+                kubelogin convert-kubeconfig -l azurecli
+      
+                echo "Setting image in Kubernetes..."
+                kubectl -n $(BE_NS) set image deployment/$(BE_DEPLOYMENT) \
+                  $(BE_CONTAINER)=$(ACR_LOGIN_SERVER)/$(BE_IMAGE_REPO):$(IMAGE_TAG)
+      
+                echo "Waiting for rollout..."
+                kubectl -n $(BE_NS) rollout restart deployment/$(BE_DEPLOYMENT)
+                kubectl -n $(BE_NS) rollout status deployment/$(BE_DEPLOYMENT)
+      
+                echo "Deploy Backend Worker image into AKS..."
+                kubectl -n $(BE_NS) set image deployment/$(WORKER_DEPLOYMENT) \
+                  $(WORKER_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(WORKER_DEPLOYMENT):$(IMAGE_TAG)
+                
+                echo "Deploy Backend Beat image into AKS..."
+                kubectl -n $(BE_NS) set image deployment/$(BEAT_DEPLOYMENT) \
+                  $(BEAT_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(BEAT_DEPLOYMENT):$(IMAGE_TAG)
+      
+                echo "Deploy Backend Flower image into AKS..."
+                kubectl -n $(BE_NS) set image deployment/$(FLOWER_DEPLOYMENT) \
+                  $(FLOWER_DEPLOYMENT)=$(ACR_LOGIN_SERVER)/$(FLOWER_DEPLOYMENT):$(IMAGE_TAG)
+      
+                echo "Celery rollout..."
+                kubectl -n $(BE_NS) scale deployment $(WORKER_DEPLOYMENT) --replicas=0
+                kubectl -n $(BE_NS) scale deployment $(BEAT_DEPLOYMENT) --replicas=0
+                kubectl -n $(BE_NS) scale deployment $(FLOWER_DEPLOYMENT) --replicas=0
+                sleep 120
+                kubectl -n $(BE_NS) scale deployment $(WORKER_DEPLOYMENT) --replicas=1
+                kubectl -n $(BE_NS) scale deployment $(BEAT_DEPLOYMENT) --replicas=1
+                kubectl -n $(BE_NS) scale deployment $(FLOWER_DEPLOYMENT) --replicas=1
+
+
+          - task: Bash@3
+            displayName: "Run DB Schema Migrations"
+            env:
+              SUBSCRIPTION_ID: $(SUBSCRIPTION_ID)
+              TENANT_ID: $(TENANT_ID)
+              DEPLOYER_CLIENT_ID: $(DEPLOYER_CLIENT_ID)
+              DEPLOYER_CLIENT_SECRET: $(DEPLOYER_CLIENT_SECRET)
+              AKS_RESOURCE_GROUP: $(AKS_RESOURCE_GROUP)        
+              AKS_NAME: $(AKS_NAME)
+              BE_NS: $(BE_NS)
+              BE_DEPLOYMENT: $(BE_DEPLOYMENT)        
+              BE_CONTAINER: $(BE_CONTAINER)
+              ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+              BE_IMAGE_REPO: $(BE_IMAGE_REPO)
+            inputs:
+              targetType: 'inline'
+              script: |
+                set -euo pipefail
+                
+                echo "==> Logging in to Azure using Service Principal"
+                az login --service-principal \
+                  --username "${DEPLOYER_CLIENT_ID}" \
+                  --password "${DEPLOYER_CLIENT_SECRET}" \
+                  --tenant   "${TENANT_ID}" >/dev/null
+                
+                echo "==> Setting subscription..."
+                
+                az account set --subscription "${SUBSCRIPTION_ID}"
+                
+                echo "==> Getting AKS kubeconfig..."
+                
+                az aks get-credentials \
+                  --resource-group "${AKS_RESOURCE_GROUP}" \
+                  --name "${AKS_NAME}" \
+                  --overwrite-existing
+      
+                echo "==> Converting kubeconfig for SP non-interactive auth"
+                kubelogin convert-kubeconfig -l azurecli            
+                
+                echo "==> Running database migrations..."
+                # Create a Kubernetes Job to run migrations
+                # Delete any existing migration job first
+                
+                kubectl -n $(BE_NS) delete job aldar-middleware-migration --ignore-not-found=true || true
+                # Wait for job to be fully deleted
+                sleep 5
+                # Create migration job
+                cat <<EOF | kubectl -n $(BE_NS) apply -f -
+                apiVersion: batch/v1
+                kind: Job
+                metadata:
+                  name: aldar-middleware-migration
+                  namespace: $(BE_NS)
+                spec:
+                  template:
+                    spec:
+                      restartPolicy: Never
+                      containers:
+                      - name: migration
+                        image: $(ACR_LOGIN_SERVER)/$(BE_IMAGE_REPO):$(IMAGE_TAG)
+                        command: ["alembic", "upgrade", "head"]
+                  backoffLimit: 3
+                EOF
+                echo "==> Waiting for migration job to complete..."
+                # Wait for job to complete (timeout after 10 minutes)
+                if kubectl -n $(BE_NS) wait --for=condition=complete --timeout=600s job/aldar-middleware-migration; then
+                  echo "✅ Migrations completed successfully!"
+                  # Get migration logs
+                  kubectl -n $(BE_NS) logs job/aldar-middleware-migration
+                  # Clean up the job
+                  kubectl -n $(BE_NS) delete job aldar-middleware-migration || true
+                else
+                  echo "❌ Migration job failed or timed out!"
+                  # Get logs for debugging
+                  kubectl -n $(BE_NS) logs job/aldar-middleware-migration || true
+                  # Clean up the job
+                  kubectl -n $(BE_NS) delete job aldar-middleware-migration || true
+                  exit 1
+                fi

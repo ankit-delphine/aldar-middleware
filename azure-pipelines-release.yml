@@ -1,0 +1,178 @@
+# Azure DevOps RELEASE Pipeline
+# Deploys Docker images from ACR to AKS
+# This pipeline should be created as a separate pipeline in Azure DevOps
+# Triggered manually or by Build Pipeline completion
+
+# To set up:
+# 1. Create new Pipeline in Azure DevOps
+# 2. Select azure-pipelines-release.yml as the YAML file
+# 3. Add pipeline variable: buildId (or pass as parameter)
+
+trigger: none  # Manual trigger - set in Azure DevOps UI
+
+parameters:
+  - name: buildId
+    displayName: 'Build ID (from Build Pipeline)'
+    type: string
+    default: 'latest'
+
+variables:
+  - group: aldar-middleware-variables
+  - name: aksResourceGroup
+    value: 'adq'
+  - name: aksClusterName
+    value: 'aiq-aks-cluster'
+  - name: kubernetesNamespace
+    value: 'aldar-middleware'
+  - name: containerRegistry
+    value: 'aiqbackendacr.azurecr.io'
+  - name: imageRepository
+    value: 'aldar-middleware'
+  - name: vmImageName
+    value: 'ubuntu-latest'
+  - name: imageTag
+    value: ${{ parameters.buildId }}
+
+stages:
+- stage: DeployToAKS
+  displayName: Deploy to AKS
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy Application to AKS
+    environment: 'production'  # Create this environment in Azure DevOps
+    pool:
+      vmImage: $(vmImageName)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          # Checkout code (for K8s manifests)
+          - checkout: self
+          
+          # Install kubectl
+          - task: KubectlInstaller@0
+            displayName: 'Install kubectl'
+            inputs:
+              kubectlVersion: '1.28.0'
+          
+          # Set AKS context
+          - task: AzureCLI@2
+            displayName: 'Get AKS Credentials'
+            inputs:
+              azureSubscription: 'aiq-azure-subscription'  # Azure service connection
+              scriptType: 'bash'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                echo "Getting AKS credentials..."
+                az aks get-credentials \
+                  --resource-group $(aksResourceGroup) \
+                  --name $(aksClusterName) \
+                  --admin
+                
+                echo "Verifying connection..."
+                kubectl cluster-info
+                kubectl get nodes
+          
+          # Apply namespace
+          - task: Bash@3
+            displayName: 'Create Namespace'
+            inputs:
+              targetType: 'inline'
+              script: |
+                kubectl apply -f k8s/namespace.yaml
+          
+          # Apply ConfigMap
+          - task: Bash@3
+            displayName: 'Apply ConfigMap'
+            inputs:
+              targetType: 'inline'
+              script: |
+                kubectl apply -f k8s/configmap.yaml
+                kubectl get configmap aldar-middleware-config -n $(kubernetesNamespace)
+          
+          # Apply Secrets (if not using Key Vault)
+          - task: Bash@3
+            displayName: 'Apply Kubernetes Secrets'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Only apply if Key Vault is disabled
+                kubectl apply -f k8s/secrets.yaml || echo "Secrets already exist or using Key Vault"
+          
+          # Apply Azure Identity (for Managed Identity)
+          - task: Bash@3
+            displayName: 'Apply Azure Identity'
+            inputs:
+              targetType: 'inline'
+              script: |
+                kubectl apply -f k8s/azure-identity.yaml || echo "Azure Identity already exists"
+          
+          # Deploy Main Application
+          - task: Bash@3
+            displayName: 'Deploy Main Application'
+            inputs:
+              targetType: 'inline'
+              script: |
+                # Update image in deployment
+                kubectl set image deployment/aldar-middleware-main \
+                  aldar-middleware-main=$(containerRegistry)/$(imageRepository)-main:$(imageTag) \
+                  -n $(kubernetesNamespace) || \
+                kubectl apply -f k8s/aldar-middleware-main-deployment.yaml
+                
+                # Wait for rollout
+                kubectl rollout status deployment/aldar-middleware-main -n $(kubernetesNamespace) --timeout=5m
+          
+          # Deploy Worker
+          - task: Bash@3
+            displayName: 'Deploy Celery Worker'
+            inputs:
+              targetType: 'inline'
+              script: |
+                kubectl set image deployment/aldar-middleware-worker \
+                  aldar-middleware-worker=$(containerRegistry)/$(imageRepository)-worker:$(imageTag) \
+                  -n $(kubernetesNamespace) || \
+                kubectl apply -f k8s/aldar-middleware-worker-deployment.yaml
+                
+                kubectl rollout status deployment/aldar-middleware-worker -n $(kubernetesNamespace) --timeout=5m
+          
+          # Deploy Beat
+          - task: Bash@3
+            displayName: 'Deploy Celery Beat'
+            inputs:
+              targetType: 'inline'
+              script: |
+                kubectl set image deployment/aldar-middleware-beat \
+                  aldar-middleware-beat=$(containerRegistry)/$(imageRepository)-beat:$(imageTag) \
+                  -n $(kubernetesNamespace) || \
+                kubectl apply -f k8s/aldar-middleware-beat-deployment.yaml
+                
+                kubectl rollout status deployment/aldar-middleware-beat -n $(kubernetesNamespace) --timeout=5m
+          
+          # Deploy Flower
+          - task: Bash@3
+            displayName: 'Deploy Celery Flower'
+            inputs:
+              targetType: 'inline'
+              script: |
+                kubectl set image deployment/aldar-middleware-flower \
+                  aldar-middleware-flower=$(containerRegistry)/$(imageRepository)-flower:$(imageTag) \
+                  -n $(kubernetesNamespace) || \
+                kubectl apply -f k8s/aldar-middleware-flower-deployment.yaml
+                
+                kubectl rollout status deployment/aldar-middleware-flower -n $(kubernetesNamespace) --timeout=5m
+          
+          # Verify Deployment
+          - task: Bash@3
+            displayName: 'Verify Deployment'
+            inputs:
+              targetType: 'inline'
+              script: |
+                echo "=== Deployment Status ==="
+                kubectl get pods -n $(kubernetesNamespace)
+                echo ""
+                echo "=== Services ==="
+                kubectl get svc -n $(kubernetesNamespace)
+                echo ""
+                echo "=== Deployment Details ==="
+                kubectl get deployment -n $(kubernetesNamespace)
+

@@ -1,0 +1,579 @@
+# Azure DevOps BUILD Pipeline
+# Builds and tests Python application, creates Docker images as artifacts
+# Deployment to AKS/ACR happens in Release Pipeline
+ 
+name: $(Build.SourceBranchName)-$(Date:yyyyMMdd)$(Rev:.r)
+ 
+trigger:
+  branches:
+    include:
+      - main
+      - fix/development
+      - feature/*
+  paths:
+    exclude:
+      - README.md
+      - '*.md'
+      - docs/*
+      - .gitignore
+ 
+pr:
+  branches:
+    include:
+      - main
+      - fix/development
+  paths:
+    exclude:
+      - README.md
+      - '*.md'
+      - docs/*
+ 
+variables:
+  # Azure Container Registry Configuration
+  - group: aldar-middleware-variables  # Assuming this contains secrets
+  - name: dockerRegistryServiceConnection
+    value: 'AIO-SUB-ACR-CON'
+  - name: imageRepository
+    value: 'aldar-middleware'
+  - name: containerRegistry
+    value: 'acradqaioshared01.azurecr.io'
+  - name: dockerfilePath
+    value: '$(Build.SourcesDirectory)'
+  - name: tag
+    value: '$(Build.BuildId)'
+  - name: vmImageName
+    value: 'ubuntu-latest'
+  - name: pythonVersion
+    value: '3.12.3'
+  - name: DOCKER_BUILDKIT
+    value: 1
+ 
+stages:
+# ==================== CODE QUALITY STAGE ====================
+- stage: CodeQuality
+  displayName: 'Code Quality & Linting'
+  jobs:
+  - job: Lint
+    displayName: 'Code Quality Checks'
+    pool:
+      name: AI-Orchestration-pool
+      vmImage: $(vmImageName)
+   
+    steps:
+    - checkout: self
+      fetchDepth: 0  # Full history for better analysis
+ 
+ 
+ 
+   
+    - task: Bash@3
+      displayName: 'Install Poetry'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+ 
+          # Install Poetry
+          curl -sSL https://install.python-poetry.org | python3 -
+ 
+          # Add Poetry to PATH
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "##vso[task.prependpath]$HOME/.local/bin"
+ 
+          # Verify installation
+          poetry --version
+   
+    - task: Bash@3
+      displayName: 'Install Dependencies with Poetry (virtualenv)'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Remove config that causes install into system python
+          poetry config --unset virtualenvs.create
+          poetry install --no-interaction --no-root --with dev
+          poetry add --dev bandit || true 
+   
+    - task: Bash@3
+      displayName: 'Run Linting (flake8)'
+      inputs:
+        targetType: 'inline'
+        script: |
+          poetry run flake8 aldar_middleware/ --count --select=E9,F63,F7,F82 --show-source --statistics || true
+          poetry run flake8 aldar_middleware/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+      continueOnError: true
+   
+    - task: Bash@3
+      displayName: 'Run Type Checking (mypy)'
+      inputs:
+        targetType: 'inline'
+        script: |
+          poetry run mypy aldar_middleware/ --ignore-missing-imports || true
+      continueOnError: true
+   
+    - task: Bash@3
+      displayName: 'Security Scan (bandit)'
+      inputs:
+        targetType: 'inline'
+        script: |
+          poetry run bandit -r aldar_middleware/ -f json -o $(Build.ArtifactStagingDirectory)/bandit-report.json || true
+      continueOnError: true
+   
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Security Report'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/bandit-report.json'
+        artifactName: 'security-reports'
+      condition: always()
+ 
+# ==================== TEST STAGE ====================
+- stage: Test
+  displayName: 'Run Tests'
+  dependsOn: CodeQuality
+  condition: succeeded()
+  jobs:
+  - job: UnitTests
+    displayName: 'Unit & Integration Tests'
+    pool:
+      name: AI-Orchestration-pool
+      vmImage: $(vmImageName)
+   
+    steps:
+    - checkout: self
+   
+    - task: Bash@3
+      displayName: 'Install Poetry'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+ 
+          # Install Poetry
+          curl -sSL https://install.python-poetry.org | python3 -
+ 
+          # Add Poetry to PATH
+          export PATH="$HOME/.local/bin:$PATH"
+          echo "##vso[task.prependpath]$HOME/.local/bin"
+ 
+          # Verify installation
+          poetry --version
+   
+    - task: Bash@3
+      displayName: 'Install Dependencies with Poetry (virtualenv)'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Remove config that causes install into system python
+          poetry config --unset virtualenvs.create
+          poetry install --no-interaction --no-root --with dev
+   
+   
+    - task: Bash@3
+      displayName: 'Run Tests'
+      inputs:
+        targetType: 'inline'
+        script: |
+          set -euo pipefail
+ 
+          # Ensure project root is on PYTHONPATH so your package can be imported
+          export PYTHONPATH=$(pwd)
+          echo "PYTHONPATH=$PYTHONPATH"
+ 
+          # Debug: show import path and check package import
+          poetry run python -c "import sys; print('sys.path =', sys.path)"
+          poetry run python -c "import aldar_middleware; print('aldar_middleware import OK:', aldar_middleware)"
+ 
+          # Run pytest via python -m pytest (safer for import paths)
+          poetry run python -m pytest tests/ -v --cov=aldar_middleware --cov-report=xml --cov-report=html --junitxml=junit.xml
+      continueOnError: true
+ 
+    - task: PublishTestResults@2
+      displayName: 'Publish Test Results'
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '**/junit.xml'
+        testRunTitle: 'Test Results'
+      condition: always()
+ 
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publish Code Coverage'
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/coverage.xml'
+        pathToSources: '$(Build.SourcesDirectory)'
+        reportDirectory: '$(System.DefaultWorkingDirectory)/htmlcov'
+      condition: always()
+   
+    - task: Bash@3
+      displayName: 'Coverage Gate Check'
+      inputs:
+        targetType: 'inline'
+        script: |
+          coverage_percentage=$(poetry run coverage report --skip-covered | grep TOTAL | awk '{print $4}' | sed 's/%//')
+          echo "Code coverage: $coverage_percentage%"
+          if (( $(echo "$coverage_percentage < 70" | bc -l) )); then
+            echo "##vso[task.logissue type=warning]Code coverage is below 70%"
+          fi
+ 
+# ==================== BUILD STAGE ====================
+- stage: Build
+  displayName: 'Build Docker Images'
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+  - job: BuildImages
+    displayName: 'Build All Docker Images'
+    pool:
+      name: AI-Orchestration-pool
+      vmImage: $(vmImageName)
+   
+    steps:
+    - checkout: self
+   
+    - task: Bash@3
+      displayName: 'Validate Dockerfiles'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Install hadolint for Dockerfile linting
+          wget -O /tmp/hadolint https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
+          chmod +x /tmp/hadolint
+         
+          echo "Validating Dockerfiles..."
+          for dockerfile in Dockerfile.main Dockerfile.worker Dockerfile.beat Dockerfile.flower; do
+            if [ -f "$dockerfile" ]; then
+              echo "Checking $dockerfile..."
+              /tmp/hadolint "$dockerfile" --ignore DL3008 --ignore DL3009 || true
+            else
+              echo "##vso[task.logissue type=warning]$dockerfile not found"
+            fi
+          done
+   
+    - task: Docker@2
+      displayName: 'Build Main Application Image'
+      inputs:
+        containerRegistry: $(dockerRegistryServiceConnection)
+        repository: $(imageRepository)-main
+        command: build
+        Dockerfile: $(dockerfilePath)/Dockerfile.main
+        buildContext: $(dockerfilePath)
+        tags: |
+          $(tag)
+          latest-build
+        arguments: |
+          --build-arg BUILD_ID=$(Build.BuildId)
+          --build-arg BUILD_DATE=$(Date:yyyy-MM-dd)
+          --build-arg VERSION=$(tag)
+          --label "org.opencontainers.image.revision=$(Build.SourceVersion)"
+          --label "org.opencontainers.image.created=$(Date:yyyy-MM-dd)"
+   
+    - task: Docker@2
+      displayName: 'Build Worker Image'
+      inputs:
+        containerRegistry: $(dockerRegistryServiceConnection)
+        repository: $(imageRepository)-worker
+        command: build
+        Dockerfile: $(dockerfilePath)/Dockerfile.worker
+        buildContext: $(dockerfilePath)
+        tags: |
+          $(tag)
+          latest-build
+        arguments: |
+          --build-arg BUILD_ID=$(Build.BuildId)
+          --build-arg BUILD_DATE=$(Date:yyyy-MM-dd)
+          --build-arg VERSION=$(tag)
+   
+    - task: Docker@2
+      displayName: 'Build Beat Image'
+      inputs:
+        containerRegistry: $(dockerRegistryServiceConnection)
+        repository: $(imageRepository)-beat
+        command: build
+        Dockerfile: $(dockerfilePath)/Dockerfile.beat
+        buildContext: $(dockerfilePath)
+        tags: |
+          $(tag)
+          latest-build
+        arguments: |
+          --build-arg BUILD_ID=$(Build.BuildId)
+          --build-arg BUILD_DATE=$(Date:yyyy-MM-dd)
+          --build-arg VERSION=$(tag)
+   
+    - task: Docker@2
+      displayName: 'Build Flower Image'
+      inputs:
+        containerRegistry: $(dockerRegistryServiceConnection)
+        repository: $(imageRepository)-flower
+        command: build
+        Dockerfile: $(dockerfilePath)/Dockerfile.flower
+        buildContext: $(dockerfilePath)
+        tags: |
+          $(tag)
+          latest-build
+        arguments: |
+          --build-arg BUILD_ID=$(Build.BuildId)
+          --build-arg BUILD_DATE=$(Date:yyyy-MM-dd)
+          --build-arg VERSION=$(tag)
+ 
+# ==================== VALIDATE STAGE ====================
+- stage: Validate
+  displayName: 'Validate Docker Images'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: ValidateImages
+    displayName: 'Security Scan & Validation'
+    pool:
+      name: AI-Orchestration-pool
+      vmImage: $(vmImageName)
+   
+    steps:
+    - checkout: self
+   
+    - task: Bash@3
+      displayName: 'Rebuild Images for Validation'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Quick rebuild for validation
+          docker build -t $(containerRegistry)/$(imageRepository)-main:$(tag) -f Dockerfile.main .
+          docker build -t $(containerRegistry)/$(imageRepository)-worker:$(tag) -f Dockerfile.worker .
+          docker build -t $(containerRegistry)/$(imageRepository)-beat:$(tag) -f Dockerfile.beat .
+          docker build -t $(containerRegistry)/$(imageRepository)-flower:$(tag) -f Dockerfile.flower .
+   
+    - task: Bash@3
+      displayName: 'Run Trivy Security Scan'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Install Trivy
+          sudo apt-get update
+          sudo apt-get install wget apt-transport-https gnupg lsb-release -y
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sourc…
+          sudo apt-get update
+          sudo apt-get install trivy -y
+         
+          # Scan images
+          for image in main worker beat flower; do
+            echo "Scanning $(containerRegistry)/$(imageRepository)-$image:$(tag)..."
+            trivy image \
+              --severity HIGH,CRITICAL \
+              --exit-code 0 \
+              --no-progress \
+              --format json \
+              --output $(Build.ArtifactStagingDirectory)/trivy-$image.json \
+              $(containerRegistry)/$(imageRepository)-$image:$(tag)
+          done
+      continueOnError: true
+   
+    - task: Bash@3
+      displayName: 'Test Image Startup'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Testing main application container..."
+          docker run --rm -d --name test-main \
+            -e DATABASE_URL=sqlite:///test.db \
+            -e SECRET_KEY=test-secret-key \
+            $(containerRegistry)/$(imageRepository)-main:$(tag) \
+            python -c "print('Container starts successfully')"
+         
+          sleep 5
+         
+          # Check if container is still running
+          if docker ps | grep -q test-main; then
+            echo "Container is running successfully"
+            docker stop test-main
+          else
+            echo "##vso[task.logissue type=error]Container failed to start"
+            docker logs test-main
+            exit 1
+          fi
+      continueOnError: true
+   
+    - task: Bash@3
+      displayName: 'Image Size Analysis'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "Docker Image Sizes:"
+          echo "=================="
+          for image in main worker beat flower; do
+            size=$(docker images $(containerRegistry)/$(imageRepository)-$image:$(tag) --format "{{.Size}}")
+            echo "$(imageRepository)-$image: $size"
+           
+            # Warn if image is too large
+            size_mb=$(docker images $(containerRegistry)/$(imageRepository)-$image:$(tag) --format "{{.Size}}" | sed 's/MB//' | sed 's/GB/*1024/' | bc 2>/dev/null || echo "0")
+            if [ ! -z "$size_mb" ] && [ "$size_mb" -gt "500" ]; then
+              echo "##vso[task.logissue type=warning]Image $(imageRepository)-$image is larger than 500MB"
+            fi
+          done
+   
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Security Scan Results'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)'
+        artifactName: 'security-scans'
+      condition: always()
+ 
+# ==================== PACKAGE STAGE ====================
+- stage: Package
+  displayName: 'Package Artifacts'
+  dependsOn: Validate
+  condition: succeeded()
+  jobs:
+  - job: PackageArtifacts
+    displayName: 'Save Docker Images & Manifests'
+    pool:
+      name: AI-Orchestration-pool
+      vmImage: $(vmImageName)
+   
+    steps:
+    - checkout: self
+   
+    - task: Bash@3
+      displayName: 'Rebuild and Save Docker Images'
+      inputs:
+        targetType: 'inline'
+        script: |
+          # Rebuild images
+          docker build -t $(containerRegistry)/$(imageRepository)-main:$(tag) -f Dockerfile.main .
+          docker build -t $(containerRegistry)/$(imageRepository)-worker:$(tag) -f Dockerfile.worker .
+          docker build -t $(containerRegistry)/$(imageRepository)-beat:$(tag) -f Dockerfile.beat .
+          docker build -t $(containerRegistry)/$(imageRepository)-flower:$(tag) -f Dockerfile.flower .
+         
+          # Create artifacts directory
+          mkdir -p $(Build.ArtifactStagingDirectory)/images
+          mkdir -p $(Build.ArtifactStagingDirectory)/manifests
+         
+          # Save images as tar files
+          echo "Saving Docker images as artifacts..."
+          docker save -o $(Build.ArtifactStagingDirectory)/images/main-$(tag).tar \
+            $(containerRegistry)/$(imageRepository)-main:$(tag)
+         
+          docker save -o $(Build.ArtifactStagingDirectory)/images/worker-$(tag).tar \
+            $(containerRegistry)/$(imageRepository)-worker:$(tag)
+         
+          docker save -o $(Build.ArtifactStagingDirectory)/images/beat-$(tag).tar \
+            $(containerRegistry)/$(imageRepository)-beat:$(tag)
+         
+          docker save -o $(Build.ArtifactStagingDirectory)/images/flower-$(tag).tar \
+            $(containerRegistry)/$(imageRepository)-flower:$(tag)
+         
+          # Create metadata file
+          cat > $(Build.ArtifactStagingDirectory)/manifests/build-metadata.json <<EOF
+          {
+            "buildId": "$(Build.BuildId)",
+            "buildNumber": "$(Build.BuildNumber)",
+            "sourceVersion": "$(Build.SourceVersion)",
+            "sourceBranch": "$(Build.SourceBranchName)",
+            "buildDate": "$(Date:yyyy-MM-dd HH:mm:ss)",
+            "images": [
+              {
+                "name": "$(imageRepository)-main",
+                "tag": "$(tag)",
+                "file": "main-$(tag).tar",
+                "registry": "$(containerRegistry)"
+              },
+              {
+                "name": "$(imageRepository)-worker",
+                "tag": "$(tag)",
+                "file": "worker-$(tag).tar",
+                "registry": "$(containerRegistry)"
+              },
+              {
+                "name": "$(imageRepository)-beat",
+                "tag": "$(tag)",
+                "file": "beat-$(tag).tar",
+                "registry": "$(containerRegistry)"
+              },
+              {
+                "name": "$(imageRepository)-flower",
+                "tag": "$(tag)",
+                "file": "flower-$(tag).tar",
+                "registry": "$(containerRegistry)"
+              }
+            ]
+          }
+          EOF
+         
+          # Copy Kubernetes manifests if they exist
+          if [ -d "k8s" ]; then
+            cp -r k8s/* $(Build.ArtifactStagingDirectory)/manifests/
+          fi
+         
+          # Create deployment script for Release pipeline
+          cat > $(Build.ArtifactStagingDirectory)/deploy.sh <<'DEPLOY'
+          #!/bin/bash
+          # Deployment script for Release Pipeline
+         
+          echo "Loading Docker images..."
+          for tar_file in images/*.tar; do
+            echo "Loading $tar_file..."
+            docker load -i "$tar_file"
+          done
+         
+          echo "Tagging images for push..."
+          docker tag $(containerRegistry)/$(imageRepository)-main:$(tag) $(containerRegistry)/$(imageRepository)-main:latest
+          docker tag $(containerRegistry)/$(imageRepository)-worker:$(tag) $(containerRegistry)/$(imageRepository)-worker:latest
+          docker tag $(containerRegistry)/$(imageRepository)-beat:$(tag) $(containerRegistry)/$(imageRepository)-beat:latest
+          docker tag $(containerRegistry)/$(imageRepository)-flower:$(tag) $(containerRegistry)/$(imageRepository)-flower:latest
+         
+          echo "Images ready for push to ACR"
+          DEPLOY
+         
+          chmod +x $(Build.ArtifactStagingDirectory)/deploy.sh
+         
+          # Display artifact sizes
+          echo "Artifact sizes:"
+          du -sh $(Build.ArtifactStagingDirectory)/images/*.tar
+   
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Docker Images'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/images'
+        artifact: 'docker-images'
+        publishLocation: 'pipeline'
+   
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Deployment Manifests'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/manifests'
+        artifact: 'deployment-manifests'
+        publishLocation: 'pipeline'
+   
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Deployment Script'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/deploy.sh'
+        artifact: 'deployment-script'
+        publishLocation: 'pipeline'
+   
+    - task: Bash@3
+      displayName: 'Build Summary'
+      inputs:
+        targetType: 'inline'
+        script: |
+          echo "========================================="
+          echo "Build Summary"
+          echo "========================================="
+          echo "Build ID: $(Build.BuildId)"
+          echo "Build Number: $(Build.BuildNumber)"
+          echo "Source Branch: $(Build.SourceBranchName)"
+          echo "Commit: $(Build.SourceVersion)"
+          echo ""
+          echo "Docker Images Built:"
+          echo "- $(containerRegistry)/$(imageRepository)-main:$(tag)"
+          echo "- $(containerRegistry)/$(imageRepository)-worker:$(tag)"
+          echo "- $(containerRegistry)/$(imageRepository)-beat:$(tag)"
+          echo "- $(containerRegistry)/$(imageRepository)-flower:$(tag)"
+          echo ""
+          echo "Artifacts Published:"
+          echo "- docker-images"
+          echo "- deployment-manifests"
+          echo "- deployment-script"
+          echo "- security-reports"
+          echo "- security-scans"
+          echo ""
+          echo "Ready for Release Pipeline deployment to AKS"
+          echo "========================================="

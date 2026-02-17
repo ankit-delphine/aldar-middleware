@@ -1,0 +1,92 @@
+apiVersion: 1
+
+notificationPolicies:
+  - orgId: 1
+    policies:
+      - receiver: default
+        group_by: ["alertname", "severity", "service"]
+        group_wait: 10s
+        group_interval: 2m
+        repeat_interval: 30m
+        
+        # Critical Severity Routing
+        routes:
+          - receiver: slack-critical
+            match:
+              severity: critical
+            group_by: ["alertname"]
+            group_wait: 10s
+            group_interval: 2m
+            repeat_interval: 30m
+            continue: true
+            
+          - receiver: pagerduty-oncall
+            match:
+              severity: critical
+            group_by: ["alertname"]
+            group_wait: 10s
+            group_interval: 2m
+            repeat_interval: 30m
+            continue: true
+            
+          - receiver: email-oncall
+            match:
+              severity: critical
+            group_by: ["alertname", "service"]
+            group_wait: 5m
+            group_interval: 15m
+            repeat_interval: 60m
+            continue: false
+        
+        # Warning Severity Routing
+        sub_routes:
+          - receiver: slack-warnings
+            match:
+              severity: warning
+            group_by: ["alertname", "service"]
+            group_wait: 2m
+            group_interval: 10m
+            repeat_interval: 2h
+            continue: true
+            
+          - receiver: email-team
+            match:
+              severity: warning
+            group_by: ["alertname"]
+            group_wait: 10m
+            group_interval: 30m
+            repeat_interval: 4h
+            continue: false
+        
+        # Info Severity Routing
+        sub_routes:
+          - receiver: slack-info
+            match:
+              severity: info
+            group_by: ["alertname", "service"]
+            group_wait: 10m
+            group_interval: 30m
+            repeat_interval: 12h
+            continue: false
+        
+        # Database Alerts Specific Routing
+        sub_routes:
+          - receiver: slack-warnings
+            match:
+              service: aiq-database
+            group_by: ["alertname"]
+            group_wait: 1m
+            group_interval: 5m
+            repeat_interval: 1h
+            continue: true
+        
+        # Observability Alerts Specific Routing
+        sub_routes:
+          - receiver: slack-info
+            match:
+              service: aiq-observability
+            group_by: ["alertname"]
+            group_wait: 5m
+            group_interval: 15m
+            repeat_interval: 6h
+            continue: false

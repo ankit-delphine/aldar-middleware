@@ -1,0 +1,63 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aldar-middleware-config
+  namespace: aldar-middleware
+data:
+  # Application Configuration
+  ALDAR_HOST: "0.0.0.0"
+  ALDAR_PORT: "8000"
+  ALDAR_WORKERS_COUNT: "2"
+  ALDAR_RELOAD: "false"
+  ALDAR_ENVIRONMENT: "production"
+  ALDAR_LOG_LEVEL: "INFO"
+  
+  # Database Configuration
+  ALDAR_DB_HOST: "aiq-postgres-service"
+  ALDAR_DB_PORT: "5432"
+  ALDAR_DB_ECHO: "false"
+  
+  # Redis Configuration
+  ALDAR_REDIS_HOST: "aiq-redis-service"
+  ALDAR_REDIS_PORT: "6379"
+  ALDAR_REDIS_BASE: "0"
+  
+  # Celery Configuration
+  ALDAR_CELERY_BROKER_URL: "redis://aiq-redis-service:6379/0"
+  ALDAR_CELERY_RESULT_BACKEND: "redis://aiq-redis-service:6379/0"
+  
+  # Azure Service Bus Configuration
+  ALDAR_SERVICE_BUS_QUEUE_NAME: "aiq-queue"
+  
+  # Security Configuration (non-sensitive)
+  ALDAR_JWT_ALGORITHM: "HS256"
+  ALDAR_JWT_ACCESS_TOKEN_EXIRE_MINUTES: "30"
+  
+  # CORS Configuration
+  ALDAR_CORS_ORIGINS: "*"
+  ALDAR_CORS_ALLOW_CREDENTIALS: "true"
+  
+  # Rate Limiting
+  ALDAR_RATE_LIMIT_REQUESTS: "100"
+  ALDAR_RATE_LIMIT_WINDOW: "60"
+  
+  # Chat Configuration
+  ALDAR_MAX_CHAT_HISTORY: "100"
+  ALDAR_CHAT_TIMEOUT: "300"
+  
+  # Query Processing
+  ALDAR_QUERY_CACHE_TTL: "3600"
+  ALDAR_SESSION_CACHE_TTL: "86400"
+  ALDAR_MAX_CONTEXT_MESSAGES: "50"
+  ALDAR_ENABLE_LONG_TERM_MEMORY: "true"
+
+  # Azure Key Vault Configuration
+  # Enable Key Vault for production (secrets loaded from Key Vault instead of Kubernetes secrets)
+  ALDAR_AZURE_KEY_VAULT_ENABLED: "true"
+  # Azure Key Vault URL
+  ALDAR_AZURE_KEY_VAULT_URL: "https://aldar-middleware-vault.vault.azure.net/"
+  # Use Managed Identity for authentication (true for AKS, false for Service Principal)
+  ALDAR_AZURE_KEY_VAULT_USE_MANAGED_IDENTITY: "true"
+  # Secret mapping: Map environment variables to Key Vault secret names
+  # Format: ENV_VAR1=SECRET_NAME1,ENV_VAR2=SECRET_NAME2
+  ALDAR_AZURE_KEY_VAULT_SECRET_MAPPING: "ALDAR_ENVIRONMENT=aiq-environment,ALDAR_DB_HOST=aiq-db-host,ALDAR_DB_PORT=aiq-db-port,ALDAR_DB_USER=aiq-db-user,ALDAR_DB_PASS=aiq-db-pass,ALDAR_REDIS_HOST=aiq-redis-host,ALDAR_REDIS_PASSWORD=aiq-redis-password,ALDAR_REDIS_URL=aiq-redis-url,ALDAR_AZURE_TENANT_ID=aiq-azure-tenant-id,ALDAR_AZURE_CLIENT_ID=aiq-azure-client-id,ALDAR_AZURE_CLIENT_SECRET=aiq-azure-client-secret,ALDAR_AZURE_AUTHORITY=aiq-azure-authority,ALDAR_JWT_SECRET_KEY=aiq-jwt-secret-key,ALDAR_JWT_ALGORITHM=aiq-jwt-algorithm,ALDAR_JWT_ACCESS_TOKEN_EXPIRE_MINUTES=aiq-jwt-access-token-expire-minutes,ALDAR_SERVICE_BUS_CONNECTION_STRING=aiq-service-bus-connection-string,ALDAR_SERVICE_BUS_QUEUE_NAME=aiq-service-bus-queue-name,ALDAR_CELERY_BROKER_URL=aiq-celery-broker-url,ALDAR_CELERY_RESULT_BACKEND=aiq-celery-result-backend,ALDAR_COSMOS_ENDPOINT=aiq-cosmos-endpoint,ALDAR_COSMOS_KEY=aiq-cosmos-key,ALDAR_COSMOS_DATABASE_NAME=aiq-cosmos-database-name,ALDAR_COSMOS_CONTAINER_NAME=aiq-cosmos-container-name,ALDAR_COSMOS_CONSISTENCY_LEVEL=aiq-cosmos-consistency-level,ALDAR_COSMOS_LOGGING_DATABASE_NAME=aiq-cosmos-logging-database-name,ALDAR_COSMOS_LOGGING_CONTAINER_NAME=aiq-cosmos-logging-container-name,ALDAR_APP_INSIGHTS_CONNECTION_STRING=aiq-app-insights-connection-string,APPLICATIONINSIGHTS_CONNECTION_STRING=applicationinsights-connection-string,ALDAR_AZURE_GRAFANA_API_KEY=aiq-azure-grafana-api-key,ALDAR_AZURE_GRAFANA_ENDPOINT=aiq-azure-grafana-endpoint,ALDAR_AZURE_PROMETHEUS_ENDPOINT=aiq-azure-prometheus-endpoint,ALDAR_AZURE_PROMETHEUS_WORKSPACE_ID=aiq-azure-prometheus-workspace-id,ALDAR_AZURE_METRICS_INGESTION_ENDPOINT=aiq-azure-metrics-ingestion-endpoint,ALDAR_AZURE_METRICS_DCR_RULE_ID=aiq-azure-metrics-dcr-rule-id,ALDAR_AZURE_METRICS_DCR_STREAM_NAME=aiq-azure-metrics-dcr-stream-name,ALDAR_AGNO_BASE_URL=aiq-agno-multiagent-base-url"

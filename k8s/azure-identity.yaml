@@ -1,0 +1,26 @@
+apiVersion: aadpodidentity.k8s.io/v1
+kind: AzureIdentity
+metadata:
+  name: aldar-middleware-identity
+  namespace: aldar-middleware
+spec:
+  type: 0  # UserAssignedMSI
+  resourceID: /subscriptions/YOUR_SUBSCRIPTION_ID/resourcegroups/YOUR_RESOURCE_GROUP/providers/Microsoft.ManagedIdentity/userAssignedIdentities/aldar-middleware-identity
+  clientID: YOUR_CLIENT_ID
+---
+apiVersion: aadpodidentity.k8s.io/v1
+kind: AzureIdentityBinding
+metadata:
+  name: aldar-middleware-identity-binding
+  namespace: aldar-middleware
+spec:
+  AzureIdentity: aldar-middleware-identity
+  Selector: aldar-middleware
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aldar-middleware-sa
+  namespace: aldar-middleware
+  annotations:
+    aadpodidentity.k8s.io/managed: "true"
