@@ -12,14 +12,20 @@ from aldar_middleware.models.user import User
 from sqlalchemy import select
 
 
-security = HTTPBearer()
+# Use auto_error=False so we can return 401 (not 403) with a clear message when no token is sent
+security = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db = Depends(get_db)
 ) -> User:
     """Get current authenticated user from Azure AD token."""
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated",
+        )
     token = credentials.credentials
     
     # Check if token is blacklisted
