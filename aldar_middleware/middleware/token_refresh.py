@@ -20,13 +20,15 @@ class TokenRefreshMiddleware(BaseHTTPMiddleware):
     4. Returns proper error if refresh fails
     """
 
-    # Paths that bypass token refresh retry
+    # Paths that bypass token refresh retry (must allow unauthenticated access)
     BYPASS_PATHS = {
         "/health",
         "/api/v1/health",
         "/api/v1/auth/login",
         "/api/v1/auth/token",
         "/api/v1/auth/refresh",
+        "/api/v1/auth/azure-ad/login",
+        "/api/v1/auth/azure-ad/callback",
         "/metrics",
         "/swagger",
         "/redoc",
