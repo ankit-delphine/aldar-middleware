@@ -118,7 +118,7 @@ def create_minimal_app():
         from fastapi.middleware.cors import CORSMiddleware
         
         app = FastAPI(
-            title="AIQ Backend",
+            title="AIDAR Backend",
             version="0.1.0",
             docs_url="/docs",
             redoc_url="/redoc"
@@ -135,7 +135,7 @@ def create_minimal_app():
         
         @app.get("/")
         async def root():
-            return {"message": "AIQ Backend is running", "status": "healthy"}
+            return {"message": "AIDAR Backend is running", "status": "healthy"}
         
         @app.get("/api/v1/health")
         async def api_health():

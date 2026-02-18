@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     log_level: LogLevel = Field(default=LogLevel.INFO)
 
     # Application
-    app_name: str = Field(default="Aldar Middleware")
+    app_name: str = Field(default="AIDAR Backend")
     app_version: str = Field(default="0.1.0")
     api_prefix: str = Field(default="/api/v1")
     docs_url: Optional[str] = Field(default="/docs")
