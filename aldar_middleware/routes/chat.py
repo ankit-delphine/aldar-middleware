@@ -5677,13 +5677,11 @@ async def send_chat_message(
             agent_public_id=agent_public_id,
         )
 
-        # Check if agent_id is empty/null - if so, use query-team endpoint instead of query-agent
-        # Check the original request.agent_id, not the resolved one (since _resolve_agent always returns Super Agent)
-        use_query_team = False
+        # Get agent record, name, and ID for response
         agent_record = None
         agent_name = None
-        obo_token_for_jwt = None  # Store OBO token to embed in user's JWT token
-
+        agent_id_for_response = agent_id_str  # Use the resolved agent_id_str (public_id) as default
+        
         # Check if original request had an agent_id (empty string or None means no agent selected)
         original_agent_id = request.agent_id
         has_agent_id = original_agent_id and original_agent_id.strip()
@@ -5706,653 +5704,156 @@ async def send_chat_message(
                 agent_record = super_agent_result.scalar_one_or_none()
                 if agent_record:
                     agent_id = agent_record.id  # Update agent_id to Super Agent's id
+                    agent_id_for_response = str(agent_record.public_id)  # Update agent_id_str for response
                     session.agent_id = agent_id  # Update session's agent_id
                     await db.commit()
             
-            agent_name = agent_record.name if agent_record else None
+            if agent_record:
+                agent_name = agent_record.name
+                # Ensure we use the agent's public_id for the response
+                agent_id_for_response = str(agent_record.public_id)
         else:
-            # No agent_id provided - use query-team endpoint
-            use_query_team = True
-            logger.info(
-                f"No agent_id provided, using query-team endpoint, "
-                f"correlation_id={correlation_id}"
-            )
+            # No agent_id provided in request - agent_id_str is already set to Super Agent's public_id
+            # from _resolve_agent, so agent_id_for_response is already correct
+            # But we should get the agent name if we have agent_id_str
+            if agent_id_str:
+                try:
+                    agent_uuid = UUID(agent_id_str)
+                    agent_result = await db.execute(
+                        select(Agent).where(Agent.public_id == agent_uuid)
+                    )
+                    agent_record = agent_result.scalar_one_or_none()
+                    if agent_record:
+                        agent_name = agent_record.name
+                        agent_id_for_response = str(agent_record.public_id)
+                except (ValueError, TypeError):
+                    # agent_id_str is not a valid UUID, keep default
+                    pass
         
-        # Use query-agent if agent exists and we have agent name
-        # Use query-team if no agent_id was provided
+        # Generate JWT token with mcp_token and aria_token for frontend to use with Agno API
+        jwt_token_for_agno = None
+        auth_header = http_request.headers.get("authorization") if http_request else None
+        
+        # Get Azure AD user access token for OBO exchange
+        user_access_token_local = None
+        if current_user.azure_ad_refresh_token:
+            logger.info("🔄 Auto-refreshing Azure AD token from stored refresh token for OBO exchange...")
+            try:
+                from aldar_middleware.auth.azure_ad import azure_ad_auth
+                from aldar_middleware.settings import settings
+                
+                # Refresh token with OBO scope
+                refresh_data = {
+                    "client_id": settings.azure_client_id,
+                    "client_secret": settings.azure_client_secret,
+                    "refresh_token": current_user.azure_ad_refresh_token,
+                    "grant_type": "refresh_token",
+                    "scope": f"openid profile offline_access {settings.azure_client_id}/.default"
+                }
+                
+                import httpx
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"{azure_ad_auth.authority}/oauth2/v2.0/token",
+                        data=refresh_data
+                    )
+                    
+                    if response.status_code == 200:
+                        token_response = response.json()
+                        user_access_token_local = token_response.get("access_token")
+                        if user_access_token_local:
+                            logger.info("✓ Azure AD user access token auto-obtained from refresh token for OBO exchange")
+                            # Update refresh token if new one provided
+                            new_refresh_token = token_response.get("refresh_token")
+                            if new_refresh_token:
+                                current_user.azure_ad_refresh_token = new_refresh_token
+                                await db.commit()
+                        else:
+                            logger.warning("⚠️  Refresh token response did not contain access_token")
+                    else:
+                        logger.warning(f"⚠️  Failed to auto-refresh Azure AD token: {response.status_code} - {response.text}")
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to auto-refresh Azure AD token from refresh token: {e}")
+        else:
+            logger.warning("⚠️  No Azure AD refresh token stored for user - OBO token exchange will be skipped")
+        
+        # Create JWT token with MCP token and ARIA token embedded for frontend to use with Agno API
+        if auth_header:
+            try:
+                from aldar_middleware.auth.obo_utils import exchange_token_obo, exchange_token_aria, add_mcp_token_to_jwt, decode_token_without_verification
+                
+                # Extract JWT token from authorization header
+                jwt_token = auth_header[7:] if auth_header.startswith("Bearer ") else auth_header
+                
+                # Check if JWT already has mcp_token and aria_token fields
+                try:
+                    decoded_jwt = decode_token_without_verification(jwt_token)
+                    if "mcp_token" in decoded_jwt and "aria_token" in decoded_jwt:
+                        logger.info("✓ JWT token already contains mcp_token and aria_token fields, using as-is")
+                        jwt_token_for_agno = jwt_token
+                    elif user_access_token_local:
+                        # JWT doesn't have mcp_token/aria_token, need to add them
+                        logger.info("🔄 JWT token doesn't have mcp_token/aria_token fields, creating new JWT with tokens...")
+                        
+                        # Exchange for OBO token (MCP)
+                        obo_token = await exchange_token_obo(user_access_token_local)
+                        logger.info(f"✓ MCP token acquired: {len(obo_token) if obo_token else 0} chars")
+                        
+                        # Exchange for ARIA token
+                        aria_token = await exchange_token_aria(user_access_token_local)
+                        logger.info(f"✓ ARIA token acquired: {len(aria_token) if aria_token else 0} chars")
+                        
+                        # Add mcp_token and aria_token to JWT
+                        logger.info(f"📦 Passing to JWT: mcp_token={len(obo_token) if obo_token else 0} chars, aria_token={len(aria_token) if aria_token else 0} chars")
+                        jwt_token_for_agno = add_mcp_token_to_jwt(jwt_token, obo_token, aria_token)
+                        logger.info(f"✓ Created new JWT token with MCP and ARIA tokens embedded")
+                    else:
+                        # No user_access_token_local available, use JWT token as-is
+                        logger.warning("⚠️  No user_access_token available for OBO exchange, using JWT token as-is (may not have mcp_token/aria_token)")
+                        jwt_token_for_agno = jwt_token
+                except Exception as e:
+                    logger.warning(f"⚠️  Could not decode JWT token: {e}, will try to create new one with MCP and ARIA tokens")
+                    if user_access_token_local:
+                        # Try to create new JWT with MCP and ARIA tokens anyway
+                        obo_token = await exchange_token_obo(user_access_token_local)
+                        aria_token = await exchange_token_aria(user_access_token_local)
+                        logger.info(f"📦 Exception path - Passing to JWT: mcp_token={len(obo_token) if obo_token else 0} chars, aria_token={len(aria_token) if aria_token else 0} chars")
+                        jwt_token_for_agno = add_mcp_token_to_jwt(jwt_token, obo_token, aria_token)
+                        logger.info(f"✓ Created new JWT token with MCP and ARIA tokens embedded")
+                    else:
+                        # Fallback: use JWT token as-is
+                        logger.warning("⚠️  No user_access_token available, using JWT token as-is")
+                        jwt_token_for_agno = jwt_token
+            except Exception as e:
+                logger.warning(f"⚠️  Failed to create JWT with MCP/ARIA tokens: {e}")
+                # Fallback: use auth header token as-is if available
+                if auth_header:
+                    jwt_token = auth_header[7:] if auth_header.startswith("Bearer ") else auth_header
+                    jwt_token_for_agno = jwt_token
+                    logger.info("✓ Using JWT token from auth header as fallback")
+                else:
+                    jwt_token_for_agno = None
+        else:
+            logger.warning("⚠️  No authorization header found - cannot generate token for Agno API")
+            jwt_token_for_agno = None
+        
+        # Initialize response variables
         response_text = None
         stream_id = None
         response_type = "stream"
         error_text = None
         external_api_error = None  # Track errors from external AGNO API
+        ai_response = None
         
-        if use_query_team:
-            # Call query-team endpoint when no agent is selected
-            try:
-                from aldar_middleware.orchestration.agno import agno_service
-                
-                user_id_str = str(current_user.id)
-                session_id_str = session.session_id
-                
-                # Extract authorization header from request to forward to AGNO API
-                auth_header = http_request.headers.get("authorization")
-                
-                # Generate unique stream_id per message/request
-                stream_id = str(uuid4())
-                
-                # Prepare custom_fields if provided
-                custom_fields = request.custom_fields if request.custom_fields else None
-                
-                # Prepare stream_config
-                stream_config = {"stream": True}
-                
-                # Prepare user_context with preferences from database
-                # Only include preferences if enable_for_new_messages is True
-                user_context = {
-                    "user_email": current_user.email,
-                    "user_name": {
-                        "user_name": current_user.username or current_user.email
-                    }
-                }
-                
-                # Check if preferences should be included based on enable_for_new_messages
-                enable_for_new_messages = False
-                if current_user.preferences and isinstance(current_user.preferences, dict):
-                    enable_for_new_messages = current_user.preferences.get("enable_for_new_messages", False)
-                
-                # Only include preferences if enable_for_new_messages is True
-                if enable_for_new_messages:
-                    user_preferences = {}
-                    if current_user.preferences and isinstance(current_user.preferences, dict):
-                        # Extract the specific preference fields that should be sent to external API
-                        user_preferences = {
-                            "preferred_formatting": current_user.preferences.get("preferred_formatting", ""),
-                            "topics_of_interest": current_user.preferences.get("topics_of_interest", ""),
-                            "about_user": current_user.preferences.get("about_user", ""),
-                            "enable_for_new_messages": current_user.preferences.get("enable_for_new_messages", False)
-                        }
-                    user_context["preferences"] = user_preferences
-                    logger.info(
-                        f"✓ User preferences included in user_context for query-team "
-                        f"(enable_for_new_messages=True), correlation_id={correlation_id}"
-                    )
-                else:
-                    logger.info(
-                        f"⊘ User preferences NOT included in user_context for query-team "
-                        f"(enable_for_new_messages=False), correlation_id={correlation_id}"
-                    )
-                
-                # Prepare attachments in the format required by query-team endpoint
-                # External API requires: attachment_uuid, download_url (mapped from blob_url), filename, content_type
-                # Frontend only sends attachment_uuid, we fetch full details and send to external API
-                team_attachments = []
-                if attachments_metadata:
-                    for att_meta in attachments_metadata:
-                        download_url = att_meta.get("blob_url") or ""
-                        # Verify SAS URL being sent to external API
-                        is_sas_url = "?" in download_url and ("sig=" in download_url or "sv=" in download_url)
-                        
-                        # Extract SAS token parameters for verification
-                        sas_params = ""
-                        if is_sas_url and "?" in download_url:
-                            url_parts = download_url.split("?", 1)
-                            if len(url_parts) > 1:
-                                sas_params = url_parts[1]
-                                # Extract key SAS parameters
-                                params_dict = {}
-                                for param in sas_params.split("&"):
-                                    if "=" in param:
-                                        key, value = param.split("=", 1)
-                                        if key in ["sv", "se", "sig"]:
-                                            params_dict[key] = value[:20] + "..." if len(value) > 20 else value
-                        
-                        logger.info(
-                            f"📎 Sending attachment to external API: "
-                            f"attachment_uuid={att_meta.get('attachment_id')}, "
-                            f"filename={att_meta.get('file_name')}, "
-                            f"is_sas_url={is_sas_url}, "
-                            f"base_url={download_url.split('?')[0] if download_url else 'empty'}, "
-                            f"sas_params={params_dict if is_sas_url else 'none'}"
-                        )
-                        
-                        # SAS URL verified - no additional logging needed in production
-                        
-                        team_attachments.append({
-                            "attachment_uuid": att_meta.get("attachment_id"),
-                            "download_url": download_url,  # This now contains SAS URL with 30-min expiry
-                            "filename": att_meta.get("file_name") or "",
-                            "content_type": att_meta.get("content_type") or "application/octet-stream"
-                        })
-                
-                logger.info(
-                    f"Using query-team endpoint, "
-                    f"stream_id={stream_id}, session_id={session_id_str}, "
-                    f"correlation_id={correlation_id}"
-                )
-                
-                # Get Azure AD user access token for OBO exchange
-                # Auto-refresh from user's stored refresh token (automatic flow)
-                user_access_token_local = None
-                if current_user.azure_ad_refresh_token:
-                    # AUTO-REFRESH: Try to get Azure AD token from refresh token (automatic flow)
-                    logger.info("🔄 Auto-refreshing Azure AD token from stored refresh token for OBO exchange...")
-                    try:
-                        from aldar_middleware.auth.azure_ad import azure_ad_auth
-                        from aldar_middleware.settings import settings
-                        
-                        # Refresh token with OBO scope
-                        refresh_data = {
-                            "client_id": settings.azure_client_id,
-                            "client_secret": settings.azure_client_secret,
-                            "refresh_token": current_user.azure_ad_refresh_token,
-                            "grant_type": "refresh_token",
-                            "scope": f"openid profile offline_access {settings.azure_client_id}/.default"
-                        }
-                        
-                        import httpx
-                        async with httpx.AsyncClient() as client:
-                            response = await client.post(
-                                f"{azure_ad_auth.authority}/oauth2/v2.0/token",
-                                data=refresh_data
-                            )
-                            
-                            if response.status_code == 200:
-                                token_response = response.json()
-                                user_access_token_local = token_response.get("access_token")
-                                if user_access_token_local:
-                                    logger.info("✓ Azure AD user access token auto-obtained from refresh token for OBO exchange")
-                                    # Update refresh token if new one provided
-                                    new_refresh_token = token_response.get("refresh_token")
-                                    if new_refresh_token:
-                                        current_user.azure_ad_refresh_token = new_refresh_token
-                                        await db.commit()
-                                else:
-                                    logger.warning("⚠️  Refresh token response did not contain access_token")
-                            else:
-                                logger.warning(f"⚠️  Failed to auto-refresh Azure AD token: {response.status_code} - {response.text}")
-                    except Exception as e:
-                        logger.warning(f"⚠️  Failed to auto-refresh Azure AD token from refresh token: {e}")
-                else:
-                    logger.warning("⚠️  No Azure AD refresh token stored for user - OBO token exchange will be skipped")
-                
-                if user_access_token_local:
-                    logger.info(f"✓ Azure AD user access token available for OBO exchange (length: {len(user_access_token_local)})")
-                else:
-                    logger.warning("⚠️  No Azure AD user access token available - OBO token exchange will be skipped")
-                
-                # IMPORTANT: Create JWT token with MCP token and ARIA token embedded BEFORE calling AGNO API
-                # The AGNO API expects the JWT token to have mcp_token and aria_token fields
-                jwt_token_with_mcp = None
-                if auth_header and user_access_token_local:
-                    try:
-                        from aldar_middleware.auth.obo_utils import exchange_token_obo, exchange_token_aria, add_mcp_token_to_jwt, decode_token_without_verification
-                        
-                        # Extract JWT token from authorization header
-                        jwt_token = auth_header[7:] if auth_header.startswith("Bearer ") else auth_header
-                        
-                        # Check if JWT already has mcp_token and aria_token fields
-                        try:
-                            decoded_jwt = decode_token_without_verification(jwt_token)
-                            if "mcp_token" in decoded_jwt and "aria_token" in decoded_jwt:
-                                logger.info("✓ JWT token already contains mcp_token and aria_token fields, using as-is")
-                                jwt_token_with_mcp = jwt_token
-                            else:
-                                # JWT doesn't have mcp_token/aria_token, need to add them
-                                logger.info(" JWT token doesn't have mcp_token/aria_token fields, creating new JWT with tokens...")
-                                
-                                # Exchange for OBO token (MCP)
-                                obo_token = await exchange_token_obo(user_access_token_local)
-                                logger.info(f"✓ MCP token acquired: {len(obo_token) if obo_token else 0} chars")
-                                
-                                # Exchange for ARIA token
-                                aria_token = await exchange_token_aria(user_access_token_local)
-                                logger.info(f"✓ ARIA token acquired: {len(aria_token) if aria_token else 0} chars")
-                                
-                                # Add mcp_token and aria_token to JWT
-                                logger.info(f" Passing to JWT: mcp_token={len(obo_token) if obo_token else 0} chars, aria_token={len(aria_token) if aria_token else 0} chars")
-                                jwt_token_with_mcp = add_mcp_token_to_jwt(jwt_token, obo_token, aria_token)
-                        except Exception as e:
-                            logger.warning(f"  Could not decode JWT token: {e}, will try to create new one with MCP and ARIA tokens")
-                            # Try to create new JWT with MCP and ARIA tokens anyway
-                            obo_token = await exchange_token_obo(user_access_token_local)
-                            aria_token = await exchange_token_aria(user_access_token_local)
-                            logger.info(f" Exception path - Passing to JWT: mcp_token={len(obo_token) if obo_token else 0} chars, aria_token={len(aria_token) if aria_token else 0} chars")
-                            jwt_token_with_mcp = add_mcp_token_to_jwt(jwt_token, obo_token, aria_token)
-                            logger.info(f"✓ Created new JWT token with MCP and ARIA tokens embedded")
-                    except Exception as e:
-                        logger.warning(f"  Failed to create JWT with MCP/ARIA tokens: {e}, will use original JWT")
-                        jwt_token_with_mcp = None
-                
-                # Use JWT with MCP token if available, otherwise use original
-                final_auth_header = f"Bearer {jwt_token_with_mcp}" if jwt_token_with_mcp else auth_header
-                
-                # Call AGNO API /query-team endpoint
-                # System will automatically: exchange OBO token, create MCP token, and send in Authorization header
-                logger.info(f"📞 Calling query_team with user_access_token: {'Yes' if user_access_token_local else 'No'}")
-                logger.info(f"   Using JWT with MCP token: {'Yes' if jwt_token_with_mcp else 'No'}")
-                agno_response = await agno_service.query_team(
-                    message=request.query,
-                    stream_id=stream_id,
-                    session_id=session_id_str,
-                    user_id=user_id_str,
-                    team_id=None,  # Will use Super Agent's public_id automatically
-                    db=db,  # Pass database session to fetch Super Agent
-                    attachments=team_attachments if team_attachments else None,
-                    custom_fields=custom_fields,
-                    user_context=user_context,
-                    stream_config=stream_config,
-                    authorization_header=final_auth_header,  # Use JWT with MCP token embedded
-                    user_access_token=user_access_token_local,  # Azure AD token (for OBO exchange and MCP token creation)
-                    obo_token=None  # Auto-generate from user_access_token
-                )
-                
-                # Extract MCP token (OBO token) from AGNO service response
-                obo_token_from_response = None
-                if isinstance(agno_response, dict) and "mcp_token" in agno_response:
-                    obo_token_from_response = agno_response.pop("mcp_token", None)
-                    logger.info(f"✓ OBO token extracted from AGNO service response")
-                
-                # Get OBO token that was used (from exchange or cache)
-                # We need to get the actual OBO token to embed in user's JWT
-                from aldar_middleware.auth.obo_utils import exchange_token_obo
-                try:
-                    if user_access_token_local:
-                        obo_token_for_jwt = await exchange_token_obo(user_access_token_local)
-                    else:
-                        obo_token_for_jwt = None
-                        logger.warning("⚠️  No user_access_token available, cannot add mcp_token to JWT")
-                except Exception as e:
-                    logger.warning(f"⚠️  Failed to get OBO token for JWT: {e}")
-                    obo_token_for_jwt = None
-                
-                # Extract stream_id and session_id from response
-                stream_id_from_response = agno_response.get("stream_id") or stream_id
-                session_id_from_response = agno_response.get("session_id") or session_id_str
-                
-                # IMPORTANT: Always use our database session.session_id, not the one from AGNO response
-                # Update stream_id and response_type for successful query-team call
-                stream_id = stream_id_from_response
-                response_type = "stream"
-                
-                # Store stream_id in the user message's tool_calls metadata
-                if user_message and user_message.tool_calls:
-                    user_message.tool_calls["stream_id"] = stream_id
-                    user_message.tool_calls["streamId"] = stream_id
-                    flag_modified(user_message, "tool_calls")
-                    await db.commit()
-                elif user_message:
-                    user_message.tool_calls = {
-                        "stream_id": stream_id,
-                        "streamId": stream_id
-                    }
-                    await db.commit()
-                
-                logger.info(
-                    f"Query-team called successfully, "
-                    f"stream_id={stream_id}, agno_session_id={session_id_from_response}, "
-                    f"db_session_id={session_id_str}, correlation_id={correlation_id}"
-                )
-                
-                # Log warning if AGNO returned a different session_id
-                if session_id_from_response != session_id_str:
-                    logger.warning(
-                        f"AGNO API returned different session_id ({session_id_from_response}) "
-                        f"than our database session_id ({session_id_str}). "
-                        f"Using database session_id in response. correlation_id={correlation_id}"
-                    )
-                
-                # Set ai_response to None since we're using external API
-                ai_response = None
-                
-            except Exception as e:
-                # Capture the external API error for reporting
-                error_message = str(e) if str(e) else f"{type(e).__name__}: Connection or timeout error"
-                if not error_message or error_message.strip() == "":
-                    error_message = f"{type(e).__name__}: Request failed (likely timeout or connection error)"
-                
-                external_api_error = {
-                    "source": "AGNO_API",
-                    "message": error_message,
-                    "agent_name": None,
-                    "agent_id": None,
-                    "endpoint_type": "query-team",
-                    "error_type": type(e).__name__
-                }
-                
-                logger.error(
-                    f"Error calling external AGNO API (query-team): {error_message}, "
-                    f"error_type={type(e).__name__}, correlation_id={correlation_id}, exception={repr(e)}"
-                )
-                
-                # Fallback to AIService if query-team fails
-                ai_service = AIService()
-                ai_response = await ai_service.generate_response(
-                    user_message=request.query,
-                    chat_id=str(session.id),
-                    user_id=str(current_user.id),
-                )
-                response_text = ai_response.get("content")
-                response_type = "direct"
-                error_text = None
-        elif agent_record and agent_name:
-            try:
-                # Call query-agent endpoint internally (via AGNO service)
-                from aldar_middleware.orchestration.agno import agno_service
-                
-                user_id_str = str(current_user.id)
-                session_id_str = session.session_id
-                
-                # Extract authorization header from request to forward to AGNO API
-                auth_header = http_request.headers.get("authorization")
-                
-                # Generate unique stream_id per message/request
-                # This allows multiple concurrent streams per session
-                # Each message gets its own stream_id for tracking
-                stream_id = str(uuid4())
-                
-                # Prepare custom_fields if provided
-                custom_fields = request.custom_fields if request.custom_fields else None
-                
-                # Prepare stream_config
-                stream_config = {"stream": True}
-                
-                # Prepare user_context with preferences from database
-                # Only include preferences if enable_for_new_messages is True
-                user_context = {
-                    "user_email": current_user.email,
-                    "user_name": {
-                        "user_name": current_user.username or current_user.email
-                    }
-                }
-                
-                # Check if preferences should be included based on enable_for_new_messages
-                enable_for_new_messages = False
-                if current_user.preferences and isinstance(current_user.preferences, dict):
-                    enable_for_new_messages = current_user.preferences.get("enable_for_new_messages", False)
-                
-                # Only include preferences if enable_for_new_messages is True
-                if enable_for_new_messages:
-                    user_preferences = {}
-                    if current_user.preferences and isinstance(current_user.preferences, dict):
-                        # Extract the specific preference fields that should be sent to external API
-                        user_preferences = {
-                            "preferred_formatting": current_user.preferences.get("preferred_formatting", ""),
-                            "topics_of_interest": current_user.preferences.get("topics_of_interest", ""),
-                            "about_user": current_user.preferences.get("about_user", ""),
-                            "enable_for_new_messages": current_user.preferences.get("enable_for_new_messages", False)
-                        }
-                    user_context["preferences"] = user_preferences
-                    logger.info(
-                        f"✓ User preferences included in user_context for query-agent "
-                        f"(enable_for_new_messages=True), correlation_id={correlation_id}"
-                    )
-                else:
-                    logger.info(
-                        f"⊘ User preferences NOT included in user_context for query-agent "
-                        f"(enable_for_new_messages=False), correlation_id={correlation_id}"
-                    )
-                
-                # Prepare attachments in the format required by query-agent endpoint
-                # External API requires: attachment_uuid, download_url (mapped from blob_url), filename, content_type
-                # Frontend only sends attachment_uuid, we fetch full details and send to external API
-                agent_attachments = []
-                if attachments_metadata:
-                    for att_meta in attachments_metadata:
-                        download_url = att_meta.get("blob_url") or ""
-                        # Verify SAS URL being sent to external API
-                        is_sas_url = "?" in download_url and ("sig=" in download_url or "sv=" in download_url)
-                        
-                        # Extract SAS token parameters for verification
-                        sas_params = ""
-                        if is_sas_url and "?" in download_url:
-                            url_parts = download_url.split("?", 1)
-                            if len(url_parts) > 1:
-                                sas_params = url_parts[1]
-                                # Extract key SAS parameters
-                                params_dict = {}
-                                for param in sas_params.split("&"):
-                                    if "=" in param:
-                                        key, value = param.split("=", 1)
-                                        if key in ["sv", "se", "sig"]:
-                                            params_dict[key] = value[:20] + "..." if len(value) > 20 else value
-                        
-                        logger.info(
-                            f"📎 Sending attachment to external API: "
-                            f"attachment_uuid={att_meta.get('attachment_id')}, "
-                            f"filename={att_meta.get('file_name')}, "
-                            f"is_sas_url={is_sas_url}, "
-                            f"base_url={download_url.split('?')[0] if download_url else 'empty'}, "
-                            f"sas_params={params_dict if is_sas_url else 'none'}"
-                        )
-                        
-                        # SAS URL verified - no additional logging needed in production
-                        
-                        agent_attachments.append({
-                            "attachment_uuid": att_meta.get("attachment_id"),
-                            "download_url": download_url,  # This now contains SAS URL with 30-min expiry
-                            "filename": att_meta.get("file_name") or "",
-                            "content_type": att_meta.get("content_type") or "application/octet-stream"
-                        })
-                
-                logger.info(
-                    f"Using query-agent endpoint for agent={agent_name}, "
-                    f"stream_id={stream_id}, session_id={session_id_str}, "
-                    f"correlation_id={correlation_id}"
-                )
-                
-                # Get Azure AD user access token for OBO exchange
-                # Auto-refresh from user's stored refresh token (automatic flow)
-                user_access_token_local = None
-                if current_user.azure_ad_refresh_token:
-                    # AUTO-REFRESH: Try to get Azure AD token from refresh token (automatic flow)
-                    logger.info("🔄 Auto-refreshing Azure AD token from stored refresh token for OBO exchange...")
-                    try:
-                        from aldar_middleware.auth.azure_ad import azure_ad_auth
-                        from aldar_middleware.settings import settings
-                        
-                        # Refresh token with OBO scope
-                        refresh_data = {
-                            "client_id": settings.azure_client_id,
-                            "client_secret": settings.azure_client_secret,
-                            "refresh_token": current_user.azure_ad_refresh_token,
-                            "grant_type": "refresh_token",
-                            "scope": f"openid profile offline_access {settings.azure_client_id}/.default"
-                        }
-                        
-                        import httpx
-                        async with httpx.AsyncClient() as client:
-                            response = await client.post(
-                                f"{azure_ad_auth.authority}/oauth2/v2.0/token",
-                                data=refresh_data
-                            )
-                            
-                            if response.status_code == 200:
-                                token_response = response.json()
-                                user_access_token = token_response.get("access_token")
-                                if user_access_token:
-                                    user_access_token_local = user_access_token  # Fix: assign to the correct variable
-                                    logger.info("✓ Azure AD user access token auto-obtained from refresh token for OBO exchange")
-                                    # Update refresh token if new one provided
-                                    new_refresh_token = token_response.get("refresh_token")
-                                    if new_refresh_token:
-                                        current_user.azure_ad_refresh_token = new_refresh_token
-                                        await db.commit()
-                                else:
-                                    logger.warning("⚠️  Refresh token response did not contain access_token")
-                            else:
-                                logger.warning(f"⚠️  Failed to auto-refresh Azure AD token: {response.status_code} - {response.text}")
-                    except Exception as e:
-                        logger.warning(f"⚠️  Failed to auto-refresh Azure AD token from refresh token: {e}")
-                else:
-                    logger.warning("⚠️  No Azure AD refresh token stored for user - OBO token exchange will be skipped")
-                
-                if user_access_token_local:
-                    logger.info(f"✓ Azure AD user access token available for OBO exchange (length: {len(user_access_token_local)})")
-                else:
-                    logger.warning("⚠️  No Azure AD user access token available - OBO token exchange will be skipped")
-                
-                # IMPORTANT: Create JWT token with MCP token and ARIA token embedded BEFORE calling AGNO API
-                # The AGNO API expects the JWT token to have mcp_token and aria_token fields
-                jwt_token_with_mcp = None
-                if auth_header and user_access_token_local:
-                    try:
-                        from aldar_middleware.auth.obo_utils import exchange_token_obo, exchange_token_aria, add_mcp_token_to_jwt, decode_token_without_verification
-                        
-                        # Extract JWT token from authorization header
-                        jwt_token = auth_header[7:] if auth_header.startswith("Bearer ") else auth_header
-                        
-                        # Check if JWT already has mcp_token and aria_token fields
-                        try:
-                            decoded_jwt = decode_token_without_verification(jwt_token)
-                            if "mcp_token" in decoded_jwt and "aria_token" in decoded_jwt:
-                                logger.info("✓ JWT token already contains mcp_token and aria_token fields, using as-is")
-                                jwt_token_with_mcp = jwt_token
-                            else:
-                                # JWT doesn't have mcp_token/aria_token, need to add them
-                                logger.info("🔄 JWT token doesn't have mcp_token/aria_token fields, creating new JWT with tokens...")
-                                
-                                # Exchange for OBO token (MCP)
-                                obo_token = await exchange_token_obo(user_access_token_local)
-                                logger.info(f"✓ MCP token acquired: {len(obo_token) if obo_token else 0} chars")
-                                
-                                # Exchange for ARIA token
-                                aria_token = await exchange_token_aria(user_access_token_local)
-                                logger.info(f"✓ ARIA token acquired: {len(aria_token) if aria_token else 0} chars")
-                                
-                                # Add mcp_token and aria_token to JWT
-                                logger.info(f"📦 Passing to JWT: mcp_token={len(obo_token) if obo_token else 0} chars, aria_token={len(aria_token) if aria_token else 0} chars")
-                                jwt_token_with_mcp = add_mcp_token_to_jwt(jwt_token, obo_token, aria_token)
-                        except Exception as e:
-                            logger.warning(f"⚠️  Could not decode JWT token: {e}, will try to create new one with MCP and ARIA tokens")
-                            # Try to create new JWT with MCP and ARIA tokens anyway
-                            obo_token = await exchange_token_obo(user_access_token_local)
-                            aria_token = await exchange_token_aria(user_access_token_local)
-                            logger.info(f"📦 Exception path - Passing to JWT: mcp_token={len(obo_token) if obo_token else 0} chars, aria_token={len(aria_token) if aria_token else 0} chars")
-                            jwt_token_with_mcp = add_mcp_token_to_jwt(jwt_token, obo_token, aria_token)
-                            logger.info(f"✓ Created new JWT token with MCP and ARIA tokens embedded")
-                    except Exception as e:
-                        logger.warning(f"⚠️  Failed to create JWT with MCP/ARIA tokens: {e}, will use original JWT")
-                        jwt_token_with_mcp = None
-                
-                # Use JWT with MCP token if available, otherwise use original
-                final_auth_header = f"Bearer {jwt_token_with_mcp}" if jwt_token_with_mcp else auth_header
-                
-                # Call AGNO API /query-agent endpoint (works for all agents including Super Agent)
-                # System will automatically: exchange OBO token, create MCP token, and send in Authorization header
-                logger.info(f"📞 Calling query_agent with user_access_token: {'Yes' if user_access_token_local else 'No'}")
-                logger.info(f"   Using JWT with MCP token: {'Yes' if jwt_token_with_mcp else 'No'}")
-                agno_response = await agno_service.query_agent(
-                    agent_name=agent_name,
-                    query=request.query,
-                    stream_id=stream_id,
-                    session_id=session_id_str,
-                    agent_id=agent_id_str,  # Pass agent_id to external DAT API
-                    user_id=user_id_str,
-                    attachments=agent_attachments if agent_attachments else None,
-                    custom_fields=custom_fields,
-                    user_context=user_context,
-                    stream_config=stream_config,
-                    authorization_header=final_auth_header,  # Use JWT with MCP token embedded
-                    user_access_token=user_access_token_local,  # Azure AD token (for OBO exchange and MCP token creation)
-                    obo_token=None  # Auto-generate from user_access_token
-                )
-                
-                # Extract MCP token (OBO token) from AGNO service response
-                obo_token_from_response = None
-                if isinstance(agno_response, dict) and "mcp_token" in agno_response:
-                    obo_token_from_response = agno_response.pop("mcp_token", None)
-                    logger.info(f"✓ OBO token extracted from AGNO service response (query-agent)")
-                
-                # Get OBO token that was used (from exchange or cache)
-                # We need to get the actual OBO token to embed in user's JWT
-                from aldar_middleware.auth.obo_utils import exchange_token_obo
-                try:
-                    if user_access_token_local:
-                        obo_token_for_jwt = await exchange_token_obo(user_access_token_local)
-                    else:
-                        obo_token_for_jwt = None
-                        logger.warning("⚠️  No user_access_token available, cannot add mcp_token to JWT")
-                except Exception as e:
-                    logger.warning(f"⚠️  Failed to get OBO token for JWT: {e}")
-                    obo_token_for_jwt = None
-                
-                # Extract stream_id and session_id from response
-                stream_id_from_response = agno_response.get("stream_id") or stream_id
-                session_id_from_response = agno_response.get("session_id") or session_id_str
-                
-                # IMPORTANT: Always use our database session.session_id, not the one from AGNO response
-                # The AGNO API may return a different session_id, but we must use our own session
-                # Update stream_id and response_type for successful query-agent call
-                stream_id = stream_id_from_response
-                response_type = "stream"
-                
-                # Store stream_id in the user message's tool_calls metadata
-                # This allows us to retrieve it later when fetching messages
-                if user_message and user_message.tool_calls:
-                    user_message.tool_calls["stream_id"] = stream_id
-                    user_message.tool_calls["streamId"] = stream_id  # Support both naming conventions
-                    flag_modified(user_message, "tool_calls")
-                    await db.commit()
-                elif user_message:
-                    # If tool_calls is None, create it with stream_id
-                    user_message.tool_calls = {
-                        "stream_id": stream_id,
-                        "streamId": stream_id
-                    }
-                    await db.commit()
-                
-                logger.info(
-                    f"Query-agent called successfully for agent={agent_name}, "
-                    f"stream_id={stream_id}, agno_session_id={session_id_from_response}, "
-                    f"db_session_id={session_id_str}, correlation_id={correlation_id}"
-                )
-                
-                # Log warning if AGNO returned a different session_id (we'll still use ours)
-                if session_id_from_response != session_id_str:
-                    logger.warning(
-                        f"AGNO API returned different session_id ({session_id_from_response}) "
-                        f"than our database session_id ({session_id_str}). "
-                        f"Using database session_id in response. correlation_id={correlation_id}"
-                )
-                
-                # Set ai_response to None since we're using external API
-                ai_response = None
-                
-            except Exception as e:
-                # Capture the external API error for reporting
-                error_message = str(e) if str(e) else f"{type(e).__name__}: Connection or timeout error"
-                if not error_message or error_message.strip() == "":
-                    error_message = f"{type(e).__name__}: Request failed (likely timeout or connection error)"
-                
-                agent_id_str = str(agent_record.public_id) if agent_record else None
-                
-                external_api_error = {
-                    "source": "AGNO_API",
-                    "message": error_message,
-                    "agent_name": agent_name,
-                    "agent_id": agent_id_str,
-                    "endpoint_type": "query-agent",
-                    "error_type": type(e).__name__
-                }
-                
-                logger.error(
-                    f"Error calling external AGNO API (query-agent): {error_message}, "
-                    f"error_type={type(e).__name__}, agent={agent_name}, "
-                    f"agent_id={agent_id_str}, correlation_id={correlation_id}, exception={repr(e)}"
-                )
-                
-                # Fallback to AIService if query-agent fails
-                ai_service = AIService()
-                ai_response = await ai_service.generate_response(
-                    user_message=request.query,
-                    chat_id=str(session.id),
-                    user_id=str(current_user.id),
-                )
-                response_text = ai_response.get("content")
-                stream_id = ai_response.get("stream_id") or ai_response.get("streamId")
-                response_type = "stream" if stream_id else "direct"
-                error_text = ai_response.get("error")
-        else:
+        # NOTE: We do NOT call Agno API here anymore
+        # Frontend will call Agno API directly using the token we return
+        logger.info(
+            f"Message processed, returning session_id and token for frontend to call Agno API directly, "
+            f"agent_name={agent_name}, correlation_id={correlation_id}"
+        )
+        
+        # Fallback to AIService if no agent found or for error handling
+        if not agent_record or not agent_name:
             # Fallback to AIService if agent not found
             ai_service = AIService()
             ai_response = await ai_service.generate_response(
@@ -6474,25 +5975,7 @@ async def send_chat_message(
             f"user_message_id={user_message_id}, ai_message_id={ai_message_id}, correlation_id={correlation_id}"
         )
 
-        # Get original JWT token from Authorization header
-        original_jwt_token = None
-        if http_request:
-            auth_header = http_request.headers.get("authorization", "")
-            if auth_header.startswith("Bearer "):
-                original_jwt_token = auth_header[7:]
-            elif auth_header:
-                original_jwt_token = auth_header
-        
-        # Add mcp_token to original JWT token if we have OBO token
-        updated_jwt_token = None
-        if original_jwt_token and obo_token_for_jwt:
-            try:
-                logger.info("🔄 Adding mcp_token field to user's JWT token...")
-                updated_jwt_token = add_mcp_token_to_jwt(original_jwt_token, obo_token_for_jwt)
-            except Exception as e:
-                logger.warning(f"⚠️  Failed to add mcp_token to JWT token: {e}")
-                updated_jwt_token = None
-        
+        # Build response with all existing fields PLUS new fields for frontend to call Agno API directly
         response_dict = {
             "success": True,
             "session_id": db_session_id,  # Always use database session.session_id
@@ -6504,19 +5987,25 @@ async def send_chat_message(
             "error": error_text,
             "external_api_error": external_api_error,  # Error from AGNO API if it failed
             "correlation_id": correlation_id,
+            # New fields for frontend to call Agno API directly
+            # Token is ready to use: Use it in Authorization header as "Bearer {token}" when calling Agno API
+            "token": jwt_token_for_agno,  # JWT token with mcp_token and aria_token embedded - ready for Agno API Authorization header
+            "agent_id": agent_id_for_response,  # Agent ID (public_id UUID string) if exists, derived from agent_id
+            "agent_name": agent_name,  # Agent name (if exists, derived from agent_id)
         }
         
-        # SECURITY: Do NOT include tokens in chat API responses
-        # Tokens should only be returned by authentication endpoints
-        # The mcp_token is already embedded in the user's JWT token stored in their session
-        # Users should use their existing JWT token from auth endpoints
-        if updated_jwt_token:
-            logger.info("JWT token updated with mcp_token (not included in response for security)")
+        logger.info(
+            f"Returning response with session_id={db_session_id}, "
+            f"agent_id={agent_id_for_response}, agent_name={agent_name}, "
+            f"token={'present' if jwt_token_for_agno else 'missing'}, "
+            f"correlation_id={correlation_id}"
+        )
         
         return response_dict
     except HTTPException:
         raise
     except Exception as exc:  # pragma: no cover
+        logger.error(f"Unhandled error in send_chat_message: {exc}", exc_info=True)
         await db.rollback()
         _raise_chat_error(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
