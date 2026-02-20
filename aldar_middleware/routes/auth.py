@@ -212,11 +212,16 @@ def get_redirect_uri(request: Optional[Request] = None, provided_uri: Optional[s
     """
     callback_path = f"{settings.api_prefix}/auth/azure-ad/callback"
 
-    # 1. Use provided URI if explicitly given
+    # 1. Use provided URI if explicitly given (e.g. frontend sends redirect_uri in query)
     if provided_uri:
         return provided_uri
 
-    # 2. Check ALDAR_URL environment variable
+    # 2. When frontend is on a different origin (e.g. localhost:3000), set this so Azure redirects to the frontend
+    frontend_redirect = os.getenv("ALDAR_FRONTEND_REDIRECT_URI", "").strip()
+    if frontend_redirect:
+        return frontend_redirect
+
+    # 3. Check ALDAR_URL environment variable
     aiq_url = os.getenv("ALDAR_URL")
     if aiq_url:
         # Parse and construct callback URL
@@ -237,19 +242,19 @@ def get_redirect_uri(request: Optional[Request] = None, provided_uri: Optional[s
         else:
             return f"{protocol}://{host}:{port}{callback_path}"
 
-    # 3. Check ALDAR_BASE_URL environment variable
+    # 4. Check ALDAR_BASE_URL environment variable
     base_url = os.getenv("ALDAR_BASE_URL")
     if base_url:
         # Ensure base_url doesn't end with /
         base_url = base_url.rstrip("/")
         return f"{base_url}{callback_path}"
 
-    # 4. Check settings.base_url
+    # 5. Check settings.base_url
     if settings.base_url:
         base_url = settings.base_url.rstrip("/")
         return f"{base_url}{callback_path}"
 
-    # 5. Try to get from request URL
+    # 6. Try to get from request URL
     if request:
         try:
             url = str(request.url)
@@ -263,7 +268,7 @@ def get_redirect_uri(request: Optional[Request] = None, provided_uri: Optional[s
         except Exception:
             pass
 
-    # 6. Construct from ALDAR_HOST + PORT environment variables
+    # 7. Construct from ALDAR_HOST + PORT environment variables
     host = os.getenv("ALDAR_HOST")
     port = os.getenv("PORT")
     if host and port:
@@ -278,7 +283,7 @@ def get_redirect_uri(request: Optional[Request] = None, provided_uri: Optional[s
         except ValueError:
             pass
 
-    # 7. Fall back to settings defaults
+    # 8. Fall back to settings defaults
     host = settings.host
     port = settings.port
 
@@ -572,26 +577,10 @@ async def azure_ad_callback(
                     await db.refresh(user)
                     logger.info(f"Successfully created user: {user.email}")
                     
-                    # Upload profile photo to blob storage if available
+                    # Profile photo: not uploaded to blob during login (avoids timeout).
+                    # Photo is served via proxy endpoint from Microsoft Graph when needed.
                     if profile_photo_bytes:
-                        try:
-                            from aldar_middleware.orchestration.blob_storage import BlobStorageService
-                            # Use main storage container for profile photos
-                            blob_service = BlobStorageService(container_name=settings.azure_storage_container_name)
-                            photo_url, blob_path, _ = await blob_service.upload_profile_photo(
-                                file_content=profile_photo_bytes,
-                                user_id=str(user.id),
-                                overwrite=True
-                            )
-                            set_profile_photo_blob_path(user, blob_path)
-                            logger.info(f"Profile photo uploaded to blob storage for user {user.email}: {blob_path}")
-                            flag_modified(user, "preferences")
-                            await db.commit()
-                            await db.refresh(user)
-                        except Exception as photo_error:
-                            logger.warning(f"Error uploading profile photo to blob storage: {photo_error}")
-                            # Continue without blob storage - fallback to proxy endpoint
-                            profile_photo_url = f"{settings.api_prefix}/auth/users/{user.id}/profile-photo"
+                        profile_photo_url = f"{settings.api_prefix}/auth/users/{user.id}/profile-photo"
                     
                     # Initialize user preferences with all required fields
                     profile_photo_url_with_user_id = get_profile_photo_url(user)
@@ -657,33 +646,10 @@ async def azure_ad_callback(
                             # Set first_logged_in_at if not already set
                             if not user.first_logged_in_at:
                                 user.first_logged_in_at = datetime.utcnow()
-                            # Upload profile photo to blob storage if available
+                            # Profile photo: not uploaded to blob during login (avoids timeout).
+                            # Photo is served via proxy endpoint from Microsoft Graph when needed.
                             if profile_photo_bytes:
-                                try:
-                                    from aldar_middleware.orchestration.blob_storage import BlobStorageService
-                                    # Use main storage container for profile photos
-                                    blob_service = BlobStorageService(container_name=settings.azure_storage_container_name)
-                                    # Delete old photo if exists
-                                    old_blob_path = get_profile_photo_blob_path(user)
-                                    if old_blob_path:
-                                        try:
-                                            await blob_service.delete_blob(old_blob_path)
-                                            logger.info(f"Deleted old profile photo for user {user.email}")
-                                        except Exception as delete_error:
-                                            logger.warning(f"Error deleting old profile photo: {delete_error}")
-                                    # Upload new photo
-                                    photo_url, blob_path, _ = await blob_service.upload_profile_photo(
-                                        file_content=profile_photo_bytes,
-                                        user_id=str(user.id),
-                                        overwrite=True
-                                    )
-                                    set_profile_photo_blob_path(user, blob_path)
-                                    flag_modified(user, "preferences")
-                                    logger.info(f"Profile photo uploaded to blob storage for user {user.email}: {blob_path}")
-                                except Exception as photo_error:
-                                    logger.warning(f"Error uploading profile photo to blob storage: {photo_error}")
-                                    # Continue without blob storage - fallback to proxy endpoint
-                                    profile_photo_url = f"{settings.api_prefix}/auth/users/{user.id}/profile-photo"
+                                profile_photo_url = f"{settings.api_prefix}/auth/users/{user.id}/profile-photo"
                             
                             # Initialize/update user preferences with all required fields
                             profile_photo_url_for_prefs = get_profile_photo_url(user)
@@ -758,33 +724,10 @@ async def azure_ad_callback(
                 # Set first_logged_in_at if not already set
                 if not user.first_logged_in_at:
                     user.first_logged_in_at = datetime.utcnow()
-                # Upload profile photo to blob storage if available
+                # Profile photo: not uploaded to blob during login (avoids timeout).
+                # Photo is served via proxy endpoint from Microsoft Graph when needed.
                 if profile_photo_bytes:
-                    try:
-                        from aldar_middleware.orchestration.blob_storage import BlobStorageService
-                        # Use main storage container for profile photos
-                        blob_service = BlobStorageService(container_name=settings.azure_storage_container_name)
-                        # Delete old photo if exists
-                        old_blob_path = get_profile_photo_blob_path(user)
-                        if old_blob_path:
-                            try:
-                                await blob_service.delete_blob(old_blob_path)
-                                logger.info(f"Deleted old profile photo for user {user.email}")
-                            except Exception as delete_error:
-                                logger.warning(f"Error deleting old profile photo: {delete_error}")
-                        # Upload new photo
-                        photo_url, blob_path, _ = await blob_service.upload_profile_photo(
-                            file_content=profile_photo_bytes,
-                            user_id=str(user.id),
-                            overwrite=True
-                        )
-                        set_profile_photo_blob_path(user, blob_path)
-                        flag_modified(user, "preferences")
-                        logger.info(f"Profile photo uploaded to blob storage for user {user.email}: {blob_path}")
-                    except Exception as photo_error:
-                        logger.warning(f"Error uploading profile photo to blob storage: {photo_error}")
-                        # Continue without blob storage - fallback to proxy endpoint
-                        profile_photo_url = f"{settings.api_prefix}/auth/users/{user.id}/profile-photo"
+                    profile_photo_url = f"{settings.api_prefix}/auth/users/{user.id}/profile-photo"
                 
                 # Initialize/update user preferences with all required fields
                 profile_photo_url_with_user_id = get_profile_photo_url(user)
