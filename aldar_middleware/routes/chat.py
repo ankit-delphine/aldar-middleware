@@ -193,7 +193,8 @@ class CreateChatSessionPayload(BaseModel):
 
 class SendChatMessageRequest(BaseModel):
     query: str = Field(..., description="User query to send to the chat")
-    agent_id: Optional[str] = Field(None, description="Agent identifier")
+    agent_id: Optional[str] = Field(None, description="Agent identifier (UUID). Optional; when provided without team_id, run is an agent run.")
+    team_id: Optional[str] = Field(None, description="Team identifier (UUID). Optional; when provided, run is a team run. If both team_id and agent_id are sent, team run takes precedence.")
     session_id: Optional[UUID] = Field(None, description="Existing session ID if resuming a chat")
     attachments: Optional[List[Dict[str, str]]] = Field(
         default=None,
@@ -239,6 +240,8 @@ class SendChatMessageRequest(BaseModel):
 
         if "agent_id" not in values and "agentId" in values:
             values["agent_id"] = values["agentId"]
+        if "team_id" not in values and "teamId" in values:
+            values["team_id"] = values["teamId"]
 
         # Convert empty string session_id to None
         if "session_id" in values and (values["session_id"] is None or (isinstance(values["session_id"], str) and values["session_id"].strip() == "")):
@@ -261,6 +264,16 @@ class SendChatMessageRequest(BaseModel):
             return str(UUID(str(value)))
         except (ValueError, TypeError):
             raise ValueError("agent_id must be a valid UUID")
+
+    @field_validator("team_id")
+    @classmethod
+    def _validate_team_id(cls, value: Optional[str]) -> Optional[str]:
+        if value is None or (isinstance(value, str) and value.strip() == ""):
+            return None
+        try:
+            return str(UUID(str(value)))
+        except (ValueError, TypeError):
+            raise ValueError("team_id must be a valid UUID")
 
 
 @router.post(
@@ -5443,7 +5456,13 @@ async def send_chat_message(
             )
 
     try:
-        agent_id, agent_id_str = await _resolve_agent(request.agent_id, db)
+        # Determine run type: team_id in request → team run; agent_id only → agent run; neither → default team run (Super Agent)
+        has_team_id = request.team_id is not None
+        has_agent_id = request.agent_id is not None
+        is_agent_run = has_agent_id and not has_team_id
+        # Resolve agent: for agent run use request.agent_id, otherwise Super Agent (for team run or default)
+        agent_identifier_for_resolution = request.agent_id if is_agent_run else None
+        agent_id, agent_id_str = await _resolve_agent(agent_identifier_for_resolution, db)
 
         # Update last_used timestamp for the agent
         await _update_agent_last_used(agent_id, db)
@@ -5975,6 +5994,12 @@ async def send_chat_message(
             f"user_message_id={user_message_id}, ai_message_id={ai_message_id}, correlation_id={correlation_id}"
         )
 
+        # Response run-type fields: team run vs agent run
+        response_agent_id: Optional[str] = agent_id_for_response if is_agent_run else None
+        response_team_id: Optional[str] = (request.team_id if has_team_id else agent_id_str) if not is_agent_run else None
+        response_is_team_run = not is_agent_run
+        response_is_agent_run = is_agent_run
+
         # Build response with all existing fields PLUS new fields for frontend to call Agno API directly
         response_dict = {
             "success": True,
@@ -5990,15 +6015,17 @@ async def send_chat_message(
             # New fields for frontend to call Agno API directly
             # Token is ready to use: Use it in Authorization header as "Bearer {token}" when calling Agno API
             "token": jwt_token_for_agno,  # JWT token with mcp_token and aria_token embedded - ready for Agno API Authorization header
-            "agent_id": agent_id_for_response,  # Agent ID (public_id UUID string) if exists, derived from agent_id
+            "agent_id": response_agent_id,  # Agent ID (public_id UUID) for agent run; null for team run
+            "team_id": response_team_id,  # Team ID (UUID) for team run (request team_id or Super Agent public_id); null for agent run
+            "is_team_run": response_is_team_run,
+            "is_agent_run": response_is_agent_run,
             "agent_name": agent_name,  # Agent name (if exists, derived from agent_id)
         }
         
         logger.info(
             f"Returning response with session_id={db_session_id}, "
-            f"agent_id={agent_id_for_response}, agent_name={agent_name}, "
-            f"token={'present' if jwt_token_for_agno else 'missing'}, "
-            f"correlation_id={correlation_id}"
+            f"agent_id={response_agent_id}, team_id={response_team_id}, is_team_run={response_is_team_run}, is_agent_run={response_is_agent_run}, "
+            f"agent_name={agent_name}, token={'present' if jwt_token_for_agno else 'missing'}, correlation_id={correlation_id}"
         )
         
         return response_dict
