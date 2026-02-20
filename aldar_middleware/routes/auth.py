@@ -31,10 +31,7 @@ security = HTTPBearer()
 # Simple in-memory store for code verifiers (in production, use Redis or database)
 code_verifier_store = {}
 
-# Rate limiting for authentication endpoints
-# Limit: 5 attempts per minute, 20 per hour per IP/username
-AUTH_RATE_LIMIT_PER_MINUTE = 5
-AUTH_RATE_LIMIT_PER_HOUR = 20
+# Rate limiting for authentication endpoints (limits configurable via settings)
 AUTH_RATE_LIMIT_WINDOW_MINUTE = 60  # seconds
 AUTH_RATE_LIMIT_WINDOW_HOUR = 3600  # seconds
 
@@ -50,6 +47,12 @@ async def _enforce_auth_rate_limit(request: Request, identifier: Optional[str] =
         identifier: Optional identifier (e.g., username) for user-based limiting
     """
     from datetime import datetime, timedelta
+
+    if not getattr(settings, "auth_rate_limit_enabled", True):
+        return
+
+    limit_per_minute = getattr(settings, "auth_rate_limit_per_minute", 5)
+    limit_per_hour = getattr(settings, "auth_rate_limit_per_hour", 20)
     
     # Use IP address and optional identifier for rate limiting
     client_ip = request.client.host if request.client else "unknown"
@@ -74,10 +77,10 @@ async def _enforce_auth_rate_limit(request: Request, identifier: Optional[str] =
         requests_last_hour = len(bucket)
         
         # Check rate limits
-        if requests_last_minute >= AUTH_RATE_LIMIT_PER_MINUTE:
+        if requests_last_minute >= limit_per_minute:
             logger.warning(
                 f"Auth rate limit exceeded (per minute): {rate_limit_key}, "
-                f"attempts={requests_last_minute}/{AUTH_RATE_LIMIT_PER_MINUTE}"
+                f"attempts={requests_last_minute}/{limit_per_minute}"
             )
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -85,10 +88,10 @@ async def _enforce_auth_rate_limit(request: Request, identifier: Optional[str] =
                 headers={"Retry-After": str(AUTH_RATE_LIMIT_WINDOW_MINUTE)}
             )
         
-        if requests_last_hour >= AUTH_RATE_LIMIT_PER_HOUR:
+        if requests_last_hour >= limit_per_hour:
             logger.warning(
                 f"Auth rate limit exceeded (per hour): {rate_limit_key}, "
-                f"attempts={requests_last_hour}/{AUTH_RATE_LIMIT_PER_HOUR}"
+                f"attempts={requests_last_hour}/{limit_per_hour}"
             )
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,

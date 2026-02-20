@@ -229,6 +229,11 @@ class Settings(BaseSettings):
     rate_limit_requests: int = Field(default=100)
     rate_limit_window: int = Field(default=60)  # seconds
 
+    # Auth endpoint rate limiting (login/callback/token refresh)
+    auth_rate_limit_enabled: bool = Field(default=True, description="Enable rate limiting on auth endpoints")
+    auth_rate_limit_per_minute: int = Field(default=50, description="Max auth attempts per minute per IP")
+    auth_rate_limit_per_hour: int = Field(default=50, description="Max auth attempts per hour per IP")
+
     # Chat Configuration
     max_chat_history: int = Field(default=100)
     chat_timeout: int = Field(default=300)  # seconds
