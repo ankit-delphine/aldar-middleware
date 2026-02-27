@@ -8,6 +8,7 @@ on:
   push:
     branches:
       - main
+      - feat/event-sse
   workflow_dispatch:
 
 jobs:
