@@ -3,7 +3,7 @@
 import json
 import time
 import uuid
-from typing import Dict, Any, Optional, List, Union
+from typing import Dict, Any, Optional, List, Union, AsyncIterator
 from datetime import datetime, timedelta
 from enum import Enum
 
@@ -15,11 +15,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_
 from sqlalchemy.orm import selectinload
 
-from aldar_middleware.settings import settings
-from aldar_middleware.database.base import get_db
-from aldar_middleware.settings.context import get_correlation_id, track_agent_call
-from aldar_middleware.auth.obo_utils import exchange_token_obo, create_mcp_token
-from aldar_middleware.monitoring.prometheus import (
+from aiq_backend.settings import settings
+from aiq_backend.database.base import get_db
+from aiq_backend.settings.context import get_correlation_id, track_agent_call
+from aiq_backend.auth.obo_utils import exchange_token_obo, create_mcp_token
+from aiq_backend.monitoring.prometheus import (
     record_external_api_request,
     record_external_api_error,
     record_external_api_cache_hit,
@@ -364,7 +364,7 @@ class AGNOAPIService:
         # Exchange for ARIA token if user_access_token is available
         if user_access_token:
             try:
-                from aldar_middleware.auth.obo_utils import exchange_token_aria
+                from aiq_backend.auth.obo_utils import exchange_token_aria
                 logger.info(" Exchanging Azure AD token for ARIA token...")
                 effective_aria_token = await exchange_token_aria(user_access_token)
                 logger.info(f"✓ ARIA token obtained ({len(effective_aria_token) if effective_aria_token else 0} chars)")
@@ -384,7 +384,7 @@ class AGNOAPIService:
                 # Verify MCP token contains mcp_token field (only in debug mode)
                 if settings.debug:
                     try:
-                        from aldar_middleware.auth.obo_utils import verify_mcp_token
+                        from aiq_backend.auth.obo_utils import verify_mcp_token
                         decoded_mcp = verify_mcp_token(mcp_token_created)
                         if "mcp_token" in decoded_mcp:
                             embedded_obo = decoded_mcp["mcp_token"]
@@ -420,7 +420,7 @@ class AGNOAPIService:
             if authorization_header:
                 jwt_candidate = authorization_header[7:] if authorization_header.startswith("Bearer ") else authorization_header
                 try:
-                    from aldar_middleware.auth.obo_utils import extract_obo_from_mcp_jwt
+                    from aiq_backend.auth.obo_utils import extract_obo_from_mcp_jwt
 
                     obo_from_mcp = extract_obo_from_mcp_jwt(jwt_candidate, verify_signature=False)
                     # Use the extracted OBO token as the Authorization header for AGNO
@@ -435,7 +435,7 @@ class AGNOAPIService:
                     # External APIs need HS256, not RS256 (Azure AD tokens)
                     if user_access_token:
                         try:
-                            from aldar_middleware.auth.obo_utils import decode_token_without_verification
+                            from aiq_backend.auth.obo_utils import decode_token_without_verification
                             
                             # Decode Azure AD token to get user info
                             decoded_azure = decode_token_without_verification(user_access_token)
@@ -459,7 +459,7 @@ class AGNOAPIService:
                                 "email": user_email,
                                 "exp": exp,
                                 "iat": iat,
-                                "iss": "aldar-middleware"
+                                "iss": "aiq-backend"
                             }
                             
                             # Add mcp_token if we have OBO token
@@ -549,7 +549,7 @@ class AGNOAPIService:
             logger.info(f"🔑 [TESTING] Final Authorization Token being sent to data API: {token_only}")
             # Also decode and show payload for debugging
             try:
-                from aldar_middleware.auth.obo_utils import decode_token_without_verification
+                from aiq_backend.auth.obo_utils import decode_token_without_verification
                 decoded = decode_token_without_verification(token_only)
                 # logger.info(f"🔑 [TESTING] Decoded Token Payload: {decoded}")
                 if "mcp_token" in decoded:
@@ -653,6 +653,126 @@ class AGNOAPIService:
         
         # Return both response data and MCP token (if created)
         return response_data, mcp_token_created
+
+    async def make_stream_request(
+        self,
+        endpoint: str,
+        data: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+        user_id: Optional[str] = None,
+        authorization_header: Optional[str] = None,
+        user_access_token: Optional[str] = None,
+        obo_token: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        """Stream a POST request to AGNO API and yield raw SSE lines as received.
+
+        Yields raw text lines exactly as sent by the external API so the caller
+        can forward them verbatim to the frontend (Server-Sent Events proxy).
+        """
+        base_url_clean = self.base_url.rstrip("/")
+        endpoint_clean = endpoint.lstrip("/")
+        full_url = f"{base_url_clean}/{endpoint_clean}"
+        correlation_id = get_correlation_id() or "stream-request"
+
+        # Build auth headers (same logic as _make_http_request)
+        default_headers: Dict[str, str] = {
+            "Content-Type": "application/json",
+            "User-Agent": f"AIQ-Backend/{settings.app_version}",
+            "Accept": "text/event-stream",
+        }
+        if correlation_id:
+            default_headers["X-Correlation-ID"] = correlation_id
+
+        # Resolve OBO token
+        final_obo_token = obo_token
+        if not final_obo_token and user_access_token:
+            try:
+                final_obo_token = await exchange_token_obo(user_access_token)
+            except Exception as exc:
+                logger.warning(f"[stream] OBO exchange failed: {exc}")
+                final_obo_token = None
+
+        # Build authorization header — mirrors _make_http_request logic exactly
+        if final_obo_token and user_access_token:
+            # Best case: MCP token (OBO embedded)
+            try:
+                effective_aria_token = None
+                try:
+                    from aiq_backend.auth.obo_utils import exchange_token_aria
+                    effective_aria_token = await exchange_token_aria(user_access_token)
+                except Exception:
+                    pass
+                mcp_token = create_mcp_token(user_access_token, final_obo_token, effective_aria_token)
+                default_headers["Authorization"] = f"Bearer {mcp_token}"
+                logger.info("[stream] ✓ Using MCP token in Authorization header")
+            except Exception as exc:
+                logger.warning(f"[stream] MCP token creation failed: {exc}")
+                if authorization_header:
+                    default_headers["Authorization"] = authorization_header
+        elif authorization_header:
+            jwt_candidate = authorization_header[7:] if authorization_header.startswith("Bearer ") else authorization_header
+            try:
+                # Try to extract OBO token from MCP JWT (if caller already built one)
+                from aiq_backend.auth.obo_utils import extract_obo_from_mcp_jwt
+                obo_from_mcp = extract_obo_from_mcp_jwt(jwt_candidate, verify_signature=False)
+                default_headers["Authorization"] = f"Bearer {obo_from_mcp}"
+                logger.info("[stream] ✓ Extracted OBO from MCP JWT")
+            except Exception:
+                # Fallback: create custom HS256 JWT from Azure AD token — same as _make_http_request
+                if user_access_token:
+                    try:
+                        from aiq_backend.auth.obo_utils import decode_token_without_verification
+                        decoded_azure = decode_token_without_verification(user_access_token)
+                        user_sub = decoded_azure.get("sub") or decoded_azure.get("oid")
+                        user_email = (
+                            decoded_azure.get("email")
+                            or decoded_azure.get("preferred_username")
+                            or decoded_azure.get("upn")
+                            or "unknown@example.com"
+                        )
+                        custom_jwt_payload = {
+                            "sub": user_sub,
+                            "email": user_email,
+                            "exp": decoded_azure.get("exp") or (int(time.time()) + 3600),
+                            "iat": decoded_azure.get("iat") or int(time.time()),
+                            "iss": "aiq-backend",
+                        }
+                        if final_obo_token:
+                            custom_jwt_payload["mcp_token"] = final_obo_token
+                        custom_jwt = jwt.encode(
+                            custom_jwt_payload,
+                            settings.jwt_secret_key,
+                            algorithm=settings.jwt_algorithm,
+                        )
+                        default_headers["Authorization"] = f"Bearer {custom_jwt}"
+                        logger.info("[stream] ✓ Created custom HS256 JWT from Azure AD token")
+                    except Exception as jwt_exc:
+                        logger.warning(f"[stream] Custom JWT creation failed: {jwt_exc}, using original header")
+                        default_headers["Authorization"] = authorization_header
+                else:
+                    default_headers["Authorization"] = authorization_header
+        elif settings.agno_api_key:
+            default_headers["Authorization"] = f"Bearer {settings.agno_api_key}"
+
+        if headers:
+            default_headers.update(headers)
+
+        if data is None:
+            data = {}
+
+        logger.info(f"[stream] Starting SSE proxy: POST {full_url}")
+
+        # Use a fresh client with streaming timeout (no read timeout limit)
+        stream_timeout = httpx.Timeout(connect=5.0, read=None, write=10.0, pool=5.0)
+        async with httpx.AsyncClient(timeout=stream_timeout, http2=True, verify=True) as client:
+            async with client.stream("POST", full_url, json=data, headers=default_headers) as response:
+                if response.status_code >= 400:
+                    error_text = await response.aread()
+                    raise ValueError(
+                        f"External API error {response.status_code} for {full_url}: {error_text.decode()[:500]}"
+                    )
+                async for line in response.aiter_lines():
+                    yield line
 
     async def get_cached_response(
         self, 
@@ -1137,7 +1257,7 @@ class AGNOService:
             if not db:
                 raise ValueError("Database session (db) is required when agent_id is not provided")
             
-            from aldar_middleware.models.menu import Agent
+            from aiq_backend.models.menu import Agent
             
             # Fetch Super Agent
             result = await db.execute(select(Agent).where(Agent.name == "Super Agent"))
@@ -1195,6 +1315,100 @@ class AGNOService:
             obo_token=obo_token,
             return_mcp_token=True  # Return MCP token in response
         )
+
+    async def query_agent_stream(
+        self,
+        agent_name: str,
+        query: str,
+        stream_id: str,
+        session_id: str,
+        agent_id: str,
+        user_id: Optional[str] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+        custom_fields: Optional[Dict[str, Any]] = None,
+        user_context: Optional[Dict[str, Any]] = None,
+        authorization_header: Optional[str] = None,
+        user_access_token: Optional[str] = None,
+        obo_token: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        """Stream /query-agent response as raw SSE lines."""
+        data: Dict[str, Any] = {
+            "agent_name": agent_name,
+            "agent_id": agent_id,
+            "query": query,
+            "stream_id": stream_id,
+            "session_id": session_id,
+            "stream_config": {"stream": True},
+        }
+        if attachments:
+            data["attachments"] = attachments
+        if custom_fields:
+            data["custom_fields"] = custom_fields
+        if user_context:
+            data["user_context"] = user_context
+
+        async for line in self.api_service.make_stream_request(
+            endpoint="/query-agent",
+            data=data,
+            user_id=user_id,
+            authorization_header=authorization_header,
+            user_access_token=user_access_token,
+            obo_token=obo_token,
+        ):
+            yield line
+
+    async def query_team_stream(
+        self,
+        message: str,
+        stream_id: str,
+        session_id: str,
+        user_id: str,
+        team_id: Optional[str] = None,
+        db: Optional[AsyncSession] = None,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+        custom_fields: Optional[Dict[str, Any]] = None,
+        user_context: Optional[Dict[str, Any]] = None,
+        authorization_header: Optional[str] = None,
+        user_access_token: Optional[str] = None,
+        obo_token: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        """Stream /query-team response as raw SSE lines."""
+        if not team_id:
+            if not db:
+                raise ValueError("Database session (db) is required when team_id is not provided")
+            from aiq_backend.models.menu import Agent
+            result = await db.execute(select(Agent).where(Agent.name == "Super Agent"))
+            super_agent = result.scalar_one_or_none()
+            if not super_agent:
+                super_agent = Agent(name="Super Agent", is_enabled=True)
+                db.add(super_agent)
+                await db.commit()
+                await db.refresh(super_agent)
+            team_id = str(super_agent.public_id)
+
+        data: Dict[str, Any] = {
+            "message": message,
+            "team_id": team_id,
+            "stream_id": stream_id,
+            "session_id": session_id,
+            "stream_config": {"stream": True},
+        }
+        if attachments:
+            data["attachments"] = attachments
+        if custom_fields:
+            data["custom_fields"] = custom_fields
+        if user_context:
+            data["user_context"] = user_context
+
+        async for line in self.api_service.make_stream_request(
+            endpoint="/query-team",
+            data=data,
+            user_id=user_id,
+            authorization_header=authorization_header,
+            user_access_token=user_access_token,
+            obo_token=obo_token,
+        ):
+            yield line
 
     # Workflow endpoints
     async def get_workflows(self, user_id: Optional[str] = None) -> Dict[str, Any]:
